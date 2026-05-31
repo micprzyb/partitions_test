@@ -84,6 +84,44 @@ extreme.
 Source: M. D. McIlroy, *A Killer Adversary for Quicksort*, Software: Practice
 and Experience 29(4), 1999. <https://www.cs.dartmouth.edu/~doug/mdmspe.pdf>
 
+## Constant-cost pseudo-median pivots (`pseudo15`, `median_of_5_medians_of_5`)
+
+Pivot quality is a cost/balance trade-off. Sampling more of the block gives a
+better-centred pivot but costs more; a Θ(n) full scan (`median_of_medians_5`,
+`midpoint_min_max`) is the most balanced but is linear per partition. Between
+median-of-3 and a full scan sit *constant-cost pseudo-medians* that inspect a
+fixed number of elements:
+
+* **`pseudo15`** — a 15-element pseudo-median computed by a fixed compare/
+  select network, returned as a **value** pivot. ~15 reads, O(1).
+* **`median_of_5_medians_of_5`** — the 5×5 analogue of Tukey's ninther: 25
+  evenly-spaced samples, the median of each group of five, then the median of
+  those five medians. Returned as a **position**. ~25 reads + tiny sorts, O(1).
+
+Both are unfazed by the median-of-k traps that ruin a naive median-of-3,
+because they sample widely across the block. Measured here (`balance_report`,
+400 trials at n=4096; `mean` ≈ left-side share, `worst_side` = worst observed
+`max(left,right)` split):
+
+| input              | median_of_3 | ninther | pseudo15 | 5×5 medians | median_of_medians_5 (Θ(n)) |
+|--------------------|-------------|---------|----------|-------------|----------------------------|
+| random (stddev)    | 0.213       | 0.160   | 0.129    | **0.109**   | 0.005                      |
+| random worst_side  | 0.992       | 0.909   | 0.879    | 0.887       | **0.514**                  |
+| organ_pipe         | 0.0002 💀   | 0.250   | 0.533    | 0.583       | 0.500                      |
+| median_of_3_killer | 0.0002 💀   | 0.250   | 0.333    | **0.417**   | 0.500                      |
+
+Selection time (`bench_pivot`, i64, total ns per call — flat in n, confirming
+O(1)): `pseudo15` ≈ 20–30 ns, `median_of_5_medians_of_5` ≈ 70–120 ns, vs
+`median_of_medians_5` ≈ 5 ns/element (i.e. ~5 ms at n=2²⁰).
+
+So the family ranks cleanly: **`median_of_5_medians_of_5` buys slightly better
+balance than `pseudo15`** (tighter spread on random, 0.42 vs 0.33 on the
+killer) by sampling 25 vs 15 elements, at **~3× the selection cost**; both crush
+median-of-3's variance and neither collapses on the adversarial inputs; and both
+are still beaten on balance by the Θ(n) median-of-medians, which is the price of
+sampling everything. Which to pick depends on whether the partition's own work
+or the pivot selection dominates — exactly what this bench is for measuring.
+
 ## Periodic / blocked structure
 
 * **sawtooth** (fixed-period ramp) and **shuffled_blocks** (sorted runs in

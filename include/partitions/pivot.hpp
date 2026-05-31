@@ -265,6 +265,29 @@ struct ninther {
     }
 };
 
+// Median of five medians-of-five: the 5x5 analogue of the ninther.  Samples 25
+// evenly-spaced elements, takes the median of each consecutive group of five,
+// then the median of those five medians.  A constant-cost (O(1)) pseudo-median
+// that samples more widely than the ninther (25 vs 9) -- a position-returning
+// counterpart to the 15-sample value pivot `pseudo15`.
+struct median_of_5_medians_of_5 {
+    static constexpr const char* name = "median_of_5_medians_of_5";
+    template <class I, class S, class Comp = std::less<>, class Proj = std::identity>
+    I operator()(I first, S last, Comp comp = {}, Proj proj = {}) const {
+        const auto n = last - first;
+        if (n < 25) return median_of_5{}(first, last, comp, proj);
+        auto less = make_less(comp, proj);
+        const auto step = n - 1;
+        I samp[25];
+        for (int k = 0; k < 25; ++k)
+            samp[k] = first + (static_cast<decltype(n)>(k) * step) / 24;
+        I med[5];
+        for (int g = 0; g < 5; ++g)
+            med[g] = detail::median_of_range(samp + g * 5, samp + g * 5 + 5, less);
+        return detail::median_of_range(med, med + 5, less);
+    }
+};
+
 // Median-of-medians (BFPRT pivot): split into groups of five, take each
 // group's median, then the *exact* median of those medians.  This guarantees
 // the pivot lies between the 30th and 70th percentile of the block.  (Taking a

@@ -80,9 +80,10 @@ include/partitions/      header-only library
   partition_api.hpp      forward/reverse × key/position adapters (+ at dispatch)
   partition_with_pivot.hpp  convention-agnostic glue (position OR value pivot)
   pivot.hpp              position pivots: first/middle/last, median_of_{3,5},
-                         ninther, median_of_medians_5, random;
-                         value pivots (may be absent): midpoint_min_max,
-                         midpoint_first_last; reordering: *_inplace
+                         ninther, median_of_5_medians_of_5, median_of_medians_5,
+                         random; value pivots (may be absent): pseudo15,
+                         midpoint_min_max, midpoint_first_last;
+                         reordering: *_inplace
   distributions.hpp      the input generators ("difficult cases")
   statistics.hpp         pivot-balance measurement + aggregation
   partitions.hpp         umbrella header + the three registries

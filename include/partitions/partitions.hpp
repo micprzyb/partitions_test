@@ -46,6 +46,7 @@ inline auto default_pivots() {
                       pivot::median_of_3{},
                       pivot::median_of_5{},
                       pivot::ninther{},
+                      pivot::median_of_5_medians_of_5{},
                       pivot::median_of_medians_5{},
                       pivot::random_pivot{},
                       pivot::midpoint_min_max{},
