@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.cxx }} / ${{ matrix.build_type }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++-14, clang++-18]
+        build_type: [Debug, Release]
+        include:
+          - cxx: g++-14
+            pkg: g++-14
+          - cxx: clang++-18
+            pkg: clang-18
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ${{ matrix.pkg }}
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          -DPARTITIONS_NATIVE=OFF
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Smoke-test tools (Release only)
+        if: matrix.build_type == 'Release'
+        run: |
+          ./build/benchmarks/bench_partition quick   > /dev/null
+          ./build/benchmarks/bench_pivot quick        > /dev/null
+          ./build/tools/balance_report 20             > /dev/null
+          echo "tools ran successfully"
+
+  format:
+    name: clang-format (advisory)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format-18
+      - name: Check formatting
+        continue-on-error: true
+        run: |
+          files=$(find include tests benchmarks tools \( -name '*.hpp' -o -name '*.cpp' \))
+          clang-format-18 --dry-run --Werror $files

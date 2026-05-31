@@ -1,0 +1,44 @@
+name: Release
+
+# Lightweight CD: on a version tag (e.g. v0.1.0), build, run the full test
+# suite, package the header-only library + docs, and publish a GitHub Release.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14
+
+      - name: Build & test
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14 -DPARTITIONS_NATIVE=OFF
+          cmake --build build -j
+          ctest --test-dir build --output-on-failure
+
+      - name: Package
+        run: |
+          name="partitions_test-${GITHUB_REF_NAME}"
+          tar czf "${name}.tar.gz" \
+            include docs README.md LICENSE CMakeLists.txt cmake
+          sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            partitions_test-*.tar.gz partitions_test-*.tar.gz.sha256

@@ -1,5 +1,7 @@
 # partitions_test
 
+[![CI](https://github.com/micprzyb/partitions_test/actions/workflows/ci.yml/badge.svg)](https://github.com/micprzyb/partitions_test/actions/workflows/ci.yml)
+
 A C++23 test bench for **custom, single-threaded partition functions** —
 checking both **correctness** and **performance**, and measuring **pivot
 quality** independently of any partition algorithm.
