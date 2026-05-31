@@ -1,0 +1,3 @@
+add_executable(balance_report balance_report.cpp)
+target_link_libraries(balance_report PRIVATE partitions::partitions)
+partitions_enable_native(balance_report)
