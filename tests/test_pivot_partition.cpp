@@ -40,41 +40,48 @@ void run_pipeline(const std::string& tname) {
         for (std::size_t n : kSizes) {
             const auto base = d.template operator()<T>(n, 0xBEEFu + n);
 
+            // One representative algorithm drives the pivot pipeline.  Using
+            // hoare_guarded exercises BOTH the position-aware `at()` fast path
+            // (for position pivots) and the predicate path (for value pivots),
+            // so every pivot convention is covered.  Algorithm x distribution
+            // coverage lives in test_partition_correctness, so iterating all
+            // partitioners here too would multiply this already-large pivot x
+            // type x distribution matrix by 6 -- a multi-minute compile for no
+            // extra signal.
+            algo::hoare_guarded alg;
             for_each(default_pivots(), [&](auto pv) {
-                for_each(default_partitioners(), [&](auto alg) {
-                    const std::string ctx = tname + "/" + d.name + "/" + pv.name +
-                                            "/" + alg.name + "/n=" + std::to_string(n);
+                const std::string ctx = tname + "/" + d.name + "/" + pv.name +
+                                        "/n=" + std::to_string(n);
 
-                    // ---- forward: select (position OR value) then partition ----
-                    {
-                        auto v = base;
-                        auto r = pv(v.begin(), v.end(), comp, proj);
-                        if constexpr (!pivot::is_value_pivot_v<decltype(r)>)
-                            REQUIRE(r >= v.begin() && r < v.end());
-                        auto key = pivot::pivot_key_of(r, proj);
-                        auto m = partition_with_pivot(alg, v.begin(), v.end(), r, comp, proj);
-                        CHECK_MESSAGE(ptv::forward_ok(v.begin(), m, v.end(), key, comp, proj),
-                                      ctx + " fwd postcondition");
-                        CHECK_MESSAGE(ptv::same_multiset(v, base), ctx + " fwd multiset");
-                        // exact "middle" contract: m - first == #{x : x < pivot}
-                        CHECK_MESSAGE((m - v.begin()) == count_less(base, key, comp, proj),
-                                      ctx + " fwd middle index");
-                    }
-                    // ---- reverse: select (position OR value) then partition ----
-                    {
-                        auto v = base;
-                        auto r = pv(v.begin(), v.end(), comp, proj);
-                        auto key = pivot::pivot_key_of(r, proj);
-                        auto m = reverse_partition_with_pivot(alg, v.begin(), v.end(), r, comp, proj);
-                        CHECK_MESSAGE(ptv::reverse_ok(v.begin(), m, v.end(), key, comp, proj),
-                                      ctx + " rev postcondition");
-                        CHECK_MESSAGE(ptv::same_multiset(v, base), ctx + " rev multiset");
-                        // reverse middle: m - first == #{x : x >= pivot} == n - #{< pivot}
-                        const std::ptrdiff_t ge =
-                            static_cast<std::ptrdiff_t>(n) - count_less(base, key, comp, proj);
-                        CHECK_MESSAGE((m - v.begin()) == ge, ctx + " rev middle index");
-                    }
-                });
+                // ---- forward: select (position OR value) then partition ----
+                {
+                    auto v = base;
+                    auto r = pv(v.begin(), v.end(), comp, proj);
+                    if constexpr (!pivot::is_value_pivot_v<decltype(r)>)
+                        REQUIRE(r >= v.begin() && r < v.end());
+                    auto key = pivot::pivot_key_of(r, proj);
+                    auto m = partition_with_pivot(alg, v.begin(), v.end(), r, comp, proj);
+                    CHECK_MESSAGE(ptv::forward_ok(v.begin(), m, v.end(), key, comp, proj),
+                                  ctx + " fwd postcondition");
+                    CHECK_MESSAGE(ptv::same_multiset(v, base), ctx + " fwd multiset");
+                    // exact "middle" contract: m - first == #{x : x < pivot}
+                    CHECK_MESSAGE((m - v.begin()) == count_less(base, key, comp, proj),
+                                  ctx + " fwd middle index");
+                }
+                // ---- reverse: select (position OR value) then partition ----
+                {
+                    auto v = base;
+                    auto r = pv(v.begin(), v.end(), comp, proj);
+                    auto key = pivot::pivot_key_of(r, proj);
+                    auto m = reverse_partition_with_pivot(alg, v.begin(), v.end(), r, comp, proj);
+                    CHECK_MESSAGE(ptv::reverse_ok(v.begin(), m, v.end(), key, comp, proj),
+                                  ctx + " rev postcondition");
+                    CHECK_MESSAGE(ptv::same_multiset(v, base), ctx + " rev multiset");
+                    // reverse middle: m - first == #{x : x >= pivot} == n - #{< pivot}
+                    const std::ptrdiff_t ge =
+                        static_cast<std::ptrdiff_t>(n) - count_less(base, key, comp, proj);
+                    CHECK_MESSAGE((m - v.begin()) == ge, ctx + " rev middle index");
+                }
             });
         }
     });

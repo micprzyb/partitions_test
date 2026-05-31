@@ -14,5 +14,11 @@ foreach(test_src IN LISTS PARTITIONS_TEST_FILES)
     add_executable(${test_name} ${test_src} framework_main.cpp)
     target_include_directories(${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(${test_name} PRIVATE partitions::partitions partitions_warnings)
+    # Tests are correctness checks over a large templated matrix; optimising
+    # them at -O3 (the Release default) costs minutes of compile time for no
+    # benefit.  Force light optimisation regardless of build type.
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${test_name} PRIVATE -O1)
+    endif()
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()

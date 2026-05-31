@@ -387,6 +387,80 @@ struct median_of_medians_5_inplace {
     }
 };
 
+
+struct pseudo15 {
+    static constexpr const char* name = "pseudo15";
+    template <class I, class S, class Comp = std::less<>, class Proj = std::identity>
+    auto operator()(I begin,  S end, Comp comp = {}, Proj proj = {})
+{
+        auto stride = std::ranges::distance(begin, end)/15;
+    auto v0  = std::invoke(proj, *begin);
+        std::advance(begin, stride);
+    auto v1  = std::invoke(proj, *begin);
+        std::advance(begin, stride);
+        auto v2  = std::invoke(proj, *begin);
+        std::advance(begin, stride);
+        auto v3  = std::invoke(proj, *begin);
+        std::advance(begin, stride);
+        auto v4  = std::invoke(proj, *begin);
+        std::advance(begin, stride);
+        auto v5  = std::invoke(proj, *begin);
+        std::advance(begin, stride);
+        auto v6  = std::invoke(proj, *begin);
+        std::advance(begin, stride);
+        auto v7  = std::invoke(proj, *begin);
+        std::advance(begin, stride);
+        auto v8  = std::invoke(proj, *begin);
+        std::advance(begin, stride);
+        auto v9  = std::invoke(proj, *begin);
+        std::advance(begin, stride);
+        auto v10  = std::invoke(proj, *begin);
+        std::advance(begin, stride);
+        auto v11  = std::invoke(proj, *begin);
+        std::advance(begin, stride);
+        auto v12  = std::invoke(proj, *begin);
+        std::advance(begin, stride);
+        auto v13  = std::invoke(proj, *begin);
+        std::advance(begin, stride);
+        auto v14  = std::invoke(proj, *begin);
+
+
+    auto v21 = std::max(std::min(v1, v11, comp), std::min(v13, v5, comp), comp);
+    auto v28 = std::max(std::min(v4, v10, comp), std::min(v12, v6, comp), comp);
+
+    auto v25 = std::min(std::max(v13, v5, comp), std::max(v1, v11, comp), comp);
+    auto v29 = std::min(std::max(v4, v10, comp), std::max(v12, v6, comp), comp);
+
+    auto v38 = std::max(v14, v2, comp);
+
+    // v50 and v51 are branch poTs (both outputs of the min/max pair are live later)
+    auto v50 = std::max(std::min(v21, v28, comp), std::min(v7, v3, comp), comp);
+    auto v51 = std::max(std::min(v25, v29, comp), std::min(v14, v2, comp), comp);
+
+    auto v61 = std::max(v50, v51, comp);
+    auto v62 = std::min(v50, v51, comp);
+
+    // v74 is a heavy branch poT (used in two independent min/max trees)
+    auto v74 = std::min(std::max(std::min(v9, v38, comp), std::min(v8, v0, comp), comp), std::max(v7, v3, comp), comp);
+
+    // v66 is a branch poT (both min and max of this sub-DAG are live)
+    auto v66 = std::min(std::max(v25, v29, comp), std::min(std::max(v8, v0, comp), std::max(v9, v38, comp), comp), comp);
+
+    // v86 is a branch poT (both outputs live in the final stage)
+    auto v86 = std::max(std::min(v74, v61, comp), v62, comp);
+
+    // Final stage - only the required min/max are kept
+    auto v102 = std::min(std::max(v74, v61, comp), std::max(v21, v28, comp), comp);
+
+    auto v103 = std::min(v66, v86, comp);
+    auto v104 = std::max(v66, v86, comp);
+    auto v112 = std::min(v104, v102, comp);
+
+        using K = std::remove_cvref_t<decltype(std::invoke(proj, *begin))>;
+    return value_pivot<K> {std::max(v103, v112, comp)};
+}
+};
+
 }  // namespace partitions::pivot
 
 #endif  // PARTITIONS_PIVOT_HPP

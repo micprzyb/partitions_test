@@ -51,7 +51,8 @@ inline auto default_pivots() {
                       pivot::midpoint_min_max{},
                       pivot::midpoint_first_last{},
                       pivot::median_of_3_inplace{},
-                      pivot::median_of_medians_5_inplace{}};
+                      pivot::median_of_medians_5_inplace{},
+                      pivot::pseudo15{}};
 }
 
 // Input distributions.
