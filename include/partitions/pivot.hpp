@@ -391,7 +391,7 @@ struct median_of_medians_5_inplace {
 struct pseudo15 {
     static constexpr const char* name = "pseudo15";
     template <class I, class S, class Comp = std::less<>, class Proj = std::identity>
-    auto operator()(I begin,  S end, Comp comp = {}, Proj proj = {})
+    auto operator()(I begin,  S end, Comp comp = {}, Proj proj = {}) const
 {
         auto stride = std::ranges::distance(begin, end)/15;
     auto v0  = std::invoke(proj, *begin);
