@@ -51,16 +51,38 @@ obtained). Add your type to `default_partitioners()` in
 The same registry pattern applies to **pivot strategies**
 (`default_pivots()`) and **input distributions** (`default_distributions()`).
 
+### Optional: exploiting the pivot position (sentinels / guards)
+
+Some algorithms are faster when handed the pivot **position** rather than just
+its value — e.g. they move the pivot to an end and use it as a sentinel to drop
+bound checks from the scan. An algorithm opts into this by additionally
+providing
+
+```cpp
+template <std::random_access_iterator I, std::sentinel_for<I> S, class Comp, class Proj>
+I at(I first, S last, I pivot, Comp comp, Proj proj) const;   // [first,m) < pivot, [m,last) >= pivot
+```
+
+`partition_by_position` dispatches to `at` when present (and reuses it on
+reverse iterators for `reverse_partition_by_position`), otherwise it falls back
+to the predicate path. Key pivots never use `at`, since a key may be absent
+from the block and so cannot serve as a sentinel. `algo::hoare_guarded` is a
+worked example (the guard wins on predictable inputs such as sorted data).
+
 ## Repository layout
 
 ```
 include/partitions/      header-only library
   types.hpp              element types (i32, i64, pair64, keyed) + projections
   concepts.hpp           PredicatePartitioner — the extension point
-  algorithms.hpp         std_partition, lomuto, lomuto_branchless, hoare, block
-  partition_api.hpp      forward/reverse × key/position adapters
-  pivot.hpp              first/middle/last, median_of_{3,5}, ninther,
-                         median_of_medians_5, random
+  algorithms.hpp         std_partition, lomuto, lomuto_branchless, hoare,
+                         hoare_guarded (position-aware), block
+  partition_api.hpp      forward/reverse × key/position adapters (+ at dispatch)
+  partition_with_pivot.hpp  convention-agnostic glue (position OR value pivot)
+  pivot.hpp              position pivots: first/middle/last, median_of_{3,5},
+                         ninther, median_of_medians_5, random;
+                         value pivots (may be absent): midpoint_min_max,
+                         midpoint_first_last; reordering: *_inplace
   distributions.hpp      the input generators ("difficult cases")
   statistics.hpp         pivot-balance measurement + aggregation
   partitions.hpp         umbrella header + the three registries
@@ -134,10 +156,17 @@ Representative findings reproduced by this bench (your hardware will vary):
 ## Extending
 
 * **New partition algorithm** → add a `PredicatePartitioner` to `algorithms.hpp`
-  and list it in `default_partitioners()`.
+  and list it in `default_partitioners()`. Optionally add an `at(...)` member
+  for a position-aware fast path (see "exploiting the pivot position" above).
 * **New pivot strategy** (e.g. your own median scheme) → add a function object
   to `pivot.hpp` and list it in `default_pivots()`; it is benchmarked and
-  balance-reported automatically.
+  balance-reported automatically. A strategy may return **either** a position
+  (an iterator into the block) **or** a value (`pivot::value_pivot<K>{key}`, for
+  a synthetic or untracked pivot such as `(min+max)/2` that need not occur in
+  the block). The harness is agnostic: `pivot::pivot_key_of` reads the key from
+  either, and `partition_with_pivot` partitions by position or by key
+  accordingly. Set `static constexpr bool reorders = true;` if it mutates the
+  block.
 * **New input** → add a generator to `distributions.hpp` and list it in
   `default_distributions()`.
 * **Multi-threaded partitions** are explicitly out of scope for now; the

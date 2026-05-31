@@ -3,10 +3,21 @@
 
 // Pivot-selection strategies.
 //
-// A strategy chooses one element of [first, last) to act as the pivot and
-// returns an iterator to it:
+// A strategy chooses a pivot for [first, last).  It may return the pivot in
+// either of two conventions:
 //
-//     I operator()(I first, S last, Comp comp, Proj proj) const;
+//   * a *position* -- an iterator into the block (the pivot is *that element).
+//   * a *value*    -- a `value_pivot<K>{key}`, a key that need NOT occur in the
+//                     block (e.g. (min+max)/2).  Use this when the strategy does
+//                     not track the element's location, or computes a synthetic
+//                     pivot.
+//
+//     I              operator()(I first, S last, Comp comp, Proj proj) const;
+//     value_pivot<K> operator()(I first, S last, Comp comp, Proj proj) const;
+//
+// Downstream code is agnostic to the convention: `pivot::pivot_key_of` extracts
+// the key from either, and `partition_with_pivot` (partition_with_pivot.hpp)
+// drives the partition by position or by key accordingly.
 //
 // A strategy MAY reorder [first, last) as a side effect -- the typical
 // median-of-medians implementation moves group medians together and runs a
@@ -30,8 +41,12 @@
 #include <cstddef>
 #include <functional>
 #include <iterator>
+#include <numeric>
 #include <random>
+#include <type_traits>
 #include <vector>
+
+#include "types.hpp"
 
 namespace partitions::pivot {
 
@@ -45,7 +60,48 @@ struct reorders<P, std::void_t<decltype(P::reorders)>>
 template <class P>
 inline constexpr bool reorders_v = reorders<P>::value;
 
+// A pivot expressed as a key value that need not appear in the block.
+template <class K>
+struct value_pivot {
+    K key;
+};
+template <class K>
+value_pivot(K) -> value_pivot<K>;
+
+template <class T>
+struct is_value_pivot : std::false_type {};
+template <class K>
+struct is_value_pivot<value_pivot<K>> : std::true_type {};
+template <class T>
+inline constexpr bool is_value_pivot_v =
+    is_value_pivot<std::remove_cvref_t<T>>::value;
+
+// Extract the pivot key from whatever a strategy returned: the value itself for
+// a value_pivot, or proj(*it) for a position.  Always returns by value, so it
+// is safe even after the referenced element is moved.
+template <class R, class Proj = std::identity>
+auto pivot_key_of(const R& r, Proj proj = {}) {
+    if constexpr (is_value_pivot_v<R>)
+        return r.key;
+    else
+        return std::invoke(proj, *r);
+}
+
 namespace detail {
+
+// (a + b) / 2 for the supported key types, avoiding overflow for integrals.
+template <class K>
+K key_midpoint(const K& a, const K& b) {
+    if constexpr (std::is_arithmetic_v<K>) {
+        return std::midpoint(a, b);
+    } else if constexpr (std::is_same_v<K, pair64>) {
+        return pair64{std::midpoint(a.first, b.first),
+                      std::midpoint(a.second, b.second)};
+    } else {
+        return a;  // no meaningful midpoint; fall back to an endpoint
+    }
+}
+
 
 // Median of the values referenced by three iterators (returns the iterator to
 // the median value).  `less(x, y)` compares the values at iterators x and y.
@@ -256,6 +312,42 @@ struct random_pivot {
         if (n <= 1) return first;
         std::uniform_int_distribution<std::ptrdiff_t> dist(0, n - 1);
         return first + dist(rng);
+    }
+};
+
+// ---- Strategies that return a VALUE (no position) -------------------------
+
+// Pivot = (min + max) / 2 of the block.  A synthetic key that is typically
+// NOT present in the block; returned as a value_pivot.  Well centred for
+// uniform data, arbitrary otherwise.  O(n).
+struct midpoint_min_max {
+    static constexpr const char* name = "midpoint_min_max";
+    template <class I, class S, class Comp = std::less<>, class Proj = std::identity>
+    auto operator()(I first, S last, Comp comp = {}, Proj proj = {}) const {
+        using K = std::remove_cvref_t<decltype(std::invoke(proj, *first))>;
+        if (first == last) return value_pivot<K>{K{}};
+        K lo = std::invoke(proj, *first), hi = lo;
+        for (I it = first; it != last; ++it) {
+            K k = std::invoke(proj, *it);
+            if (comp(k, lo)) lo = k;
+            if (comp(hi, k)) hi = k;
+        }
+        return value_pivot<K>{detail::key_midpoint(lo, hi)};
+    }
+};
+
+// Pivot = (first + last) / 2.  O(1) synthetic key (the midpoint of the two end
+// elements); also returned as a value, since it need not be an element.
+struct midpoint_first_last {
+    static constexpr const char* name = "midpoint_first_last";
+    template <class I, class S, class Comp = std::less<>, class Proj = std::identity>
+    auto operator()(I first, S last, Comp = {}, Proj proj = {}) const {
+        using K = std::remove_cvref_t<decltype(std::invoke(proj, *first))>;
+        const auto n = last - first;
+        if (n <= 0) return value_pivot<K>{K{}};
+        K a = std::invoke(proj, *first);
+        K b = std::invoke(proj, *(first + (n - 1)));
+        return value_pivot<K>{detail::key_midpoint(a, b)};
     }
 };
 

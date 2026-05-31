@@ -40,9 +40,9 @@ void run_one(Dist dist, Pivot pv, std::size_t n, int trials) {
     samples.reserve(static_cast<std::size_t>(trials));
     for (int t = 0; t < trials; ++t) {
         auto data = dist.template operator()<i64>(n, static_cast<std::uint64_t>(t) * 2654435761u + 1);
-        auto it = pv(data.begin(), data.end(), comp, proj);
+        auto r = pv(data.begin(), data.end(), comp, proj);
         samples.push_back(stat::measure_balance(data.begin(), data.end(),
-                                                std::invoke(proj, *it), comp, proj));
+                                                pivot::pivot_key_of(r, proj), comp, proj));
     }
     auto s = stat::summary::from(samples);
     std::printf("%s,%zu,%s,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n", dist.name, n,

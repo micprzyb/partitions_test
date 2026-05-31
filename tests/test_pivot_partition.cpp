@@ -45,13 +45,14 @@ void run_pipeline(const std::string& tname) {
                     const std::string ctx = tname + "/" + d.name + "/" + pv.name +
                                             "/" + alg.name + "/n=" + std::to_string(n);
 
-                    // ---- forward: select (maybe reorder) then partition ----
+                    // ---- forward: select (position OR value) then partition ----
                     {
                         auto v = base;
-                        auto pos = pv(v.begin(), v.end(), comp, proj);
-                        REQUIRE(pos >= v.begin() && pos < v.end());
-                        auto key = std::invoke(proj, *pos);
-                        auto m = partition_by_position(alg, v.begin(), v.end(), pos, comp, proj);
+                        auto r = pv(v.begin(), v.end(), comp, proj);
+                        if constexpr (!pivot::is_value_pivot_v<decltype(r)>)
+                            REQUIRE(r >= v.begin() && r < v.end());
+                        auto key = pivot::pivot_key_of(r, proj);
+                        auto m = partition_with_pivot(alg, v.begin(), v.end(), r, comp, proj);
                         CHECK_MESSAGE(ptv::forward_ok(v.begin(), m, v.end(), key, comp, proj),
                                       ctx + " fwd postcondition");
                         CHECK_MESSAGE(ptv::same_multiset(v, base), ctx + " fwd multiset");
@@ -59,12 +60,12 @@ void run_pipeline(const std::string& tname) {
                         CHECK_MESSAGE((m - v.begin()) == count_less(base, key, comp, proj),
                                       ctx + " fwd middle index");
                     }
-                    // ---- reverse: select (maybe reorder) then partition ----
+                    // ---- reverse: select (position OR value) then partition ----
                     {
                         auto v = base;
-                        auto pos = pv(v.begin(), v.end(), comp, proj);
-                        auto key = std::invoke(proj, *pos);
-                        auto m = reverse_partition_by_position(alg, v.begin(), v.end(), pos, comp, proj);
+                        auto r = pv(v.begin(), v.end(), comp, proj);
+                        auto key = pivot::pivot_key_of(r, proj);
+                        auto m = reverse_partition_with_pivot(alg, v.begin(), v.end(), r, comp, proj);
                         CHECK_MESSAGE(ptv::reverse_ok(v.begin(), m, v.end(), key, comp, proj),
                                       ctx + " rev postcondition");
                         CHECK_MESSAGE(ptv::same_multiset(v, base), ctx + " rev multiset");

@@ -46,16 +46,16 @@ void run_one(Dist dist, Pivot pv, std::size_t n) {
         if constexpr (pivot::reorders_v<Pivot>) data = master;
     };
     auto do_work = [&] {
-        auto it = pv(data.begin(), data.end(), comp, proj);
-        bench::do_not_optimize(*it);
+        auto r = pv(data.begin(), data.end(), comp, proj);
+        bench::do_not_optimize(pivot::pivot_key_of(r, proj));
     };
     auto res = bench::measure(reps, setup, do_work);
 
     // Balance is permutation-invariant; measure it on a fresh selection.
     auto bcopy = master;
-    auto pit = pv(bcopy.begin(), bcopy.end(), comp, proj);
+    auto r = pv(bcopy.begin(), bcopy.end(), comp, proj);
     auto bal = stat::measure_balance(bcopy.begin(), bcopy.end(),
-                                     std::invoke(proj, *pit), comp, proj);
+                                     pivot::pivot_key_of(r, proj), comp, proj);
 
     std::printf("%s,%s,%s,%zu,%llu,%.1f,%.4f,%.4f\n", type_name<T>(), dist.name,
                 pv.name, n, (unsigned long long)res.reps, res.median_ns,

@@ -114,6 +114,56 @@ struct hoare {
 };
 
 // ---------------------------------------------------------------------------
+// Guarded Hoare -- a *position-aware* partitioner.
+//
+// Given the pivot POSITION (not just its value), it moves the pivot element to
+// the end of the range to act as a sentinel: because that element equals the
+// pivot it is never "< pivot", so the left-to-right scan is guaranteed to stop
+// there and needs NO per-element bound check.  After each swap the just-placed
+// (>= pivot) element becomes the sentinel for the next ascending scan, so the
+// guard holds throughout.  This is the classic "move pivot to an end, use it as
+// a guard" optimisation, and it is only sound when the pivot is a real element
+// of the block -- hence it lives behind the position interface.
+//
+// It also provides the plain predicate `operator()` as the fallback used for
+// key pivots (which may be absent, so no sentinel can be assumed).
+// ---------------------------------------------------------------------------
+struct hoare_guarded {
+    static constexpr const char* name = "hoare_guarded";
+
+    // Fallback (key pivots / no position): ordinary bounds-checked Hoare.
+    template <std::random_access_iterator I, std::sentinel_for<I> S, class Pred>
+    I operator()(I first, S last, Pred keep_left) const {
+        return hoare{}(first, last, std::move(keep_left));
+    }
+
+    // Position-aware forward partition: [first, m) < pivot, [m, last) >= pivot.
+    template <std::random_access_iterator I, std::sentinel_for<I> S,
+              class Comp = std::less<>, class Proj = std::identity>
+    I at(I first, S last_s, I pivot, Comp comp = {}, Proj proj = {}) const {
+        I last = first + (last_s - first);
+        I sentinel = last - 1;
+        std::iter_swap(pivot, sentinel);             // pivot now guards the < scan
+        auto pivot_key = std::invoke(proj, *sentinel);  // stable copy
+        auto below = [&](I it) {
+            return static_cast<bool>(
+                std::invoke(comp, std::invoke(proj, *it), pivot_key));
+        };
+        I lo = first;
+        I hi = sentinel;  // the sentinel sits at hi and stops the ascending scan
+        while (true) {
+            while (below(lo)) ++lo;                  // GUARDED: no bound check
+            --hi;
+            while (hi > lo && !below(hi)) --hi;       // bounds-checked descending
+            if (lo >= hi) break;
+            std::iter_swap(lo, hi);
+            ++lo;
+        }
+        return lo;  // [first,lo) < pivot; [lo,last) >= pivot (incl. the sentinel)
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Block (BlockQuicksort) partitioning.
 //
 // Hoare's two-pointer scheme, but the comparison results for a block of

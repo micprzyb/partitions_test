@@ -18,10 +18,16 @@ void check_in_range() {
         for (std::size_t n : {1u, 2u, 3u, 4u, 5u, 8u, 9u, 16u, 24u, 1000u}) {
             auto v = d.template operator()<T>(n, 7u + n);
             for_each(default_pivots(), [&](auto pv) {
-                auto it = pv(v.begin(), v.end(), comp, proj);
-                CHECK_MESSAGE(it >= v.begin() && it < v.end(),
-                              std::string(pv.name) + " out of range, n=" +
-                                  std::to_string(n));
+                auto r = pv(v.begin(), v.end(), comp, proj);
+                if constexpr (!pivot::is_value_pivot_v<decltype(r)>) {
+                    // position-returning strategy: must point inside the block
+                    CHECK_MESSAGE(r >= v.begin() && r < v.end(),
+                                  std::string(pv.name) + " out of range, n=" +
+                                      std::to_string(n));
+                } else {
+                    // value-returning strategy: key is usable, no position
+                    (void)pivot::pivot_key_of(r, proj);
+                }
             });
         }
     });

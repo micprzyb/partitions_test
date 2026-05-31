@@ -54,16 +54,22 @@ I partition_by_key(Alg alg, I first, S last, const Key& pivot, Comp comp = {},
     });
 }
 
-// Pivot given as a position; its key is captured before any reordering.
+// Pivot given as a position.  If the algorithm offers a position-aware fast
+// path (`alg.at(...)`, e.g. one that uses the pivot element as a sentinel), it
+// is used; otherwise the key is captured up front and the predicate path runs.
 template <class Alg, std::random_access_iterator I, std::sentinel_for<I> S,
           class Comp = std::less<>, class Proj = std::identity>
 I partition_by_position(Alg alg, I first, S last, I pivot, Comp comp = {},
                         Proj proj = {}) {
-    auto pivot_key = std::invoke(proj, *pivot);  // stable copy
-    return alg(first, last, [&](const auto& x) {
-        return static_cast<bool>(
-            std::invoke(comp, std::invoke(proj, x), pivot_key));
-    });
+    if constexpr (requires { alg.at(first, last, pivot, comp, proj); }) {
+        return alg.at(first, last, pivot, comp, proj);
+    } else {
+        auto pivot_key = std::invoke(proj, *pivot);  // stable copy
+        return alg(first, last, [&](const auto& x) {
+            return static_cast<bool>(
+                std::invoke(comp, std::invoke(proj, x), pivot_key));
+        });
+    }
 }
 
 // ----- reverse partition: [>= pivot | smaller than pivot] ------------------
@@ -78,15 +84,30 @@ I reverse_partition_by_key(Alg alg, I first, S last, const Key& pivot,
     });
 }
 
+// Reverse partition by position.  A reverse partition is a forward partition
+// performed over the reversed range, so a position-aware `alg.at` is reused on
+// reverse iterators and the boundary is mapped back with `.base()`; otherwise
+// the predicate path runs.
 template <class Alg, std::random_access_iterator I, std::sentinel_for<I> S,
           class Comp = std::less<>, class Proj = std::identity>
 I reverse_partition_by_position(Alg alg, I first, S last, I pivot,
                                 Comp comp = {}, Proj proj = {}) {
-    auto pivot_key = std::invoke(proj, *pivot);
-    return alg(first, last, [&](const auto& x) {
-        return !static_cast<bool>(
-            std::invoke(comp, std::invoke(proj, x), pivot_key));
-    });
+    I end = first + (last - first);
+    auto rfirst = std::make_reverse_iterator(end);
+    if constexpr (requires {
+                      alg.at(rfirst, std::make_reverse_iterator(first),
+                             std::make_reverse_iterator(pivot + 1), comp, proj);
+                  }) {
+        auto rp = alg.at(rfirst, std::make_reverse_iterator(first),
+                         std::make_reverse_iterator(pivot + 1), comp, proj);
+        return rp.base();
+    } else {
+        auto pivot_key = std::invoke(proj, *pivot);
+        return alg(first, last, [&](const auto& x) {
+            return !static_cast<bool>(
+                std::invoke(comp, std::invoke(proj, x), pivot_key));
+        });
+    }
 }
 
 }  // namespace partitions
