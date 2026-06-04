@@ -1,3 +1,7 @@
 add_executable(balance_report balance_report.cpp)
 target_link_libraries(balance_report PRIVATE partitions::partitions)
 partitions_enable_native(balance_report)
+
+add_executable(verify_small_sort verify_small_sort.cpp)
+target_link_libraries(verify_small_sort PRIVATE partitions::partitions)
+partitions_enable_native(verify_small_sort)

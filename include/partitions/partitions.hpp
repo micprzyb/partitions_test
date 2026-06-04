@@ -47,13 +47,24 @@ inline auto default_pivots() {
                       pivot::median_of_5{},
                       pivot::ninther{},
                       pivot::median_of_5_medians_of_5{},
+                      pivot::median_of_5_medians_of_5_898{},
+                      pivot::median_of_5_medians_of_3{},
+                      pivot::median_of_3_medians_of_5{},
                       pivot::median_of_medians_5{},
                       pivot::random_pivot{},
                       pivot::midpoint_min_max{},
                       pivot::midpoint_first_last{},
                       pivot::median_of_3_inplace{},
                       pivot::median_of_medians_5_inplace{},
-                      pivot::pseudo15{}};
+                      pivot::pseudo15{},
+                    pivot::pseudo15_s5{},
+                    pivot::pseudo9{},
+                    pivot::pseudo9_s1{},
+                    pivot::pseudo9_s2{},
+                    pivot::pseudo9_s3{},
+                    pivot::pseudo9_s4{},
+                    pivot::pseudo9_s5{},
+                    pivot::sorting_network_9{}};
 }
 
 // Input distributions.
