@@ -37,6 +37,35 @@ struct pair64 {
 
 static_assert(sizeof(pair64) == 16);
 
+// Two more lexicographic pair shapes, exercising different first-key types and
+// a different size class.  Field order matches the defaulted operator<=> (first
+// then second), so std::less and the branchless lex compare-exchange agree.
+//
+//   * pair_fi {float,int}   - 8 bytes: a non-integral 8-byte aggregate (the
+//                             generic small-type path, plus a floating compare).
+//   * pair_di {double,int}  - 16 bytes: same size as pair64 but a *floating*
+//                             first key, so the compare is a comiss/ucomisd, not
+//                             an integer cmp.
+//
+// We deliberately do NOT add pair<long,int>: it is also 16 bytes with integer
+// keys, i.e. layout- and behaviour-identical to pair64, so benchmarking it
+// would just reproduce the pair64 numbers (see docs/small_sort_findings.md).
+struct pair_fi {
+    float first{};
+    int second{};
+    friend constexpr bool operator==(const pair_fi&, const pair_fi&) = default;
+    friend constexpr auto operator<=>(const pair_fi&, const pair_fi&) = default;
+};
+struct pair_di {
+    double first{};
+    int second{};
+    friend constexpr bool operator==(const pair_di&, const pair_di&) = default;
+    friend constexpr auto operator<=>(const pair_di&, const pair_di&) = default;
+};
+
+static_assert(sizeof(pair_fi) == 8);
+static_assert(sizeof(pair_di) == 16);
+
 // A record with a separate sort key and payload, used to test that a
 // non-identity projection is threaded correctly through every code path.
 struct keyed {
@@ -61,6 +90,8 @@ constexpr const char* type_name() {
     if constexpr (std::is_same_v<T, i32>) return "i32";
     else if constexpr (std::is_same_v<T, i64>) return "i64";
     else if constexpr (std::is_same_v<T, pair64>) return "pair64";
+    else if constexpr (std::is_same_v<T, pair_fi>) return "pair_fi";
+    else if constexpr (std::is_same_v<T, pair_di>) return "pair_di";
     else if constexpr (std::is_same_v<T, keyed>) return "keyed";
     else return "unknown";
 }

@@ -78,6 +78,22 @@ using clk = std::chrono::steady_clock;
 // Build `batch` random blocks of `n` elements, concatenated.  `narrow` shrinks
 // the value range so many keys tie (exercises pair64 second-key tie-breaks and
 // the branchy sorts' equal-key paths).
+// Build one element of type T from a random-integer source.  For the pair
+// shapes both fields draw independently so the lexicographic second-key path is
+// genuinely exercised (especially in the narrow/tie-heavy config).
+template <class T, class Rng, class Dist>
+T make_elem(Rng& rng, Dist& dist) {
+    if constexpr (std::is_same_v<T, pair64>) {
+        return pair64{dist(rng), dist(rng)};
+    } else if constexpr (std::is_same_v<T, pair_fi>) {
+        return pair_fi{static_cast<float>(dist(rng)), static_cast<int>(dist(rng))};
+    } else if constexpr (std::is_same_v<T, pair_di>) {
+        return pair_di{static_cast<double>(dist(rng)), static_cast<int>(dist(rng))};
+    } else {
+        return static_cast<T>(dist(rng));
+    }
+}
+
 template <class T>
 std::vector<T> make_master(std::size_t n, std::size_t batch, std::uint64_t seed,
                            bool narrow) {
@@ -87,15 +103,8 @@ std::vector<T> make_master(std::size_t n, std::size_t batch, std::uint64_t seed,
     std::uniform_int_distribution<i64> dist(lo, hi);
     std::vector<T> master;
     master.reserve(n * batch);
-    for (std::size_t b = 0; b < batch; ++b) {
-        for (std::size_t i = 0; i < n; ++i) {
-            if constexpr (std::is_same_v<T, pair64>) {
-                master.push_back(pair64{dist(rng), dist(rng)});
-            } else {
-                master.push_back(static_cast<T>(dist(rng)));
-            }
-        }
-    }
+    for (std::size_t b = 0; b < batch; ++b)
+        for (std::size_t i = 0; i < n; ++i) master.push_back(make_elem<T>(rng, dist));
     return master;
 }
 
@@ -217,6 +226,9 @@ int main(int argc, char** argv) {
     if (argc > 1) only_n = static_cast<std::size_t>(std::strtoull(argv[1], nullptr, 10));
     std::printf("type,algo,n,total_sorts,samples,min_ns,p50_ns,p90_ns,mean_ns,cv_pct\n");
     run_type<i64>(only_n);
-    run_type<pair64>(only_n);
+    run_type<pair64>(only_n);     // pair<long,long>, 16B, integer keys
+    run_type<pair_fi>(only_n);    // pair<float,int>,  8B
+    run_type<pair_di>(only_n);    // pair<double,int>, 16B, floating first key
+    // pair<long,int> intentionally omitted: 16B with integer keys == pair64.
     return 0;
 }

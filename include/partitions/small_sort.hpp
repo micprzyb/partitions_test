@@ -87,7 +87,15 @@ constexpr bool is_default_less =
     std::is_same_v<std::decay_t<Cmp>, std::less<>> &&
     std::is_same_v<std::decay_t<Proj>, std::identity>;
 
-// Branchless 4-cmov swap for any 16-byte trivial type.
+// Branchless 16-byte swap via integer XOR-mask (mask = 0 or all-ones).
+//
+// IMPORTANT: this must be XOR-mask, not a `swap ? hi : lo` cmov form.  When the
+// element contains a floating field (e.g. pair_di {double,int}) GCC keeps it in
+// XMM registers; it has no cheap branchless conditional move of an XMM pair, so
+// a cmov-style swap is lowered to a *branch per compare-exchange* -- which then
+// mispredicts on random data and dominates the cost.  Reinterpreting the 16
+// bytes as two integers and blending with an arithmetic mask forces the swap
+// into GP registers with no branch and no XMM dependency.
 template <class T>
 [[gnu::always_inline]] inline void half_swap(T& a, T& b, bool swap) {
     std::uint64_t a0, a1, b0, b1;
@@ -95,15 +103,45 @@ template <class T>
     std::memcpy(&a1, reinterpret_cast<const char*>(&a) + 8, 8);
     std::memcpy(&b0, &b, 8);
     std::memcpy(&b1, reinterpret_cast<const char*>(&b) + 8, 8);
-    const std::uint64_t na0 = swap ? b0 : a0;
-    const std::uint64_t na1 = swap ? b1 : a1;
-    const std::uint64_t nb0 = swap ? a0 : b0;
-    const std::uint64_t nb1 = swap ? a1 : b1;
-    std::memcpy(&a, &na0, 8);
-    std::memcpy(reinterpret_cast<char*>(&a) + 8, &na1, 8);
-    std::memcpy(&b, &nb0, 8);
-    std::memcpy(reinterpret_cast<char*>(&b) + 8, &nb1, 8);
+    const std::uint64_t mask = 0ull - static_cast<std::uint64_t>(swap);
+    const std::uint64_t d0 = (a0 ^ b0) & mask;
+    const std::uint64_t d1 = (a1 ^ b1) & mask;
+    a0 ^= d0; b0 ^= d0;
+    a1 ^= d1; b1 ^= d1;
+    std::memcpy(&a, &a0, 8);
+    std::memcpy(reinterpret_cast<char*>(&a) + 8, &a1, 8);
+    std::memcpy(&b, &b0, 8);
+    std::memcpy(reinterpret_cast<char*>(&b) + 8, &b1, 8);
 }
+
+// XOR-mask swap for any trivially-copyable type of size <= 8 -- guaranteed
+// branchless (no per-half cmov that GCC might turn back into a branch).
+template <class T>
+[[gnu::always_inline]] inline void word_swap(T& a, T& b, bool swap) {
+    static_assert(sizeof(T) <= 8);
+    std::uint64_t av = 0, bv = 0;
+    std::memcpy(&av, &a, sizeof(T));
+    std::memcpy(&bv, &b, sizeof(T));
+    const std::uint64_t mask = 0ull - static_cast<std::uint64_t>(swap);
+    const std::uint64_t d = (av ^ bv) & mask;
+    av ^= d;
+    bv ^= d;
+    std::memcpy(&a, &av, sizeof(T));
+    std::memcpy(&b, &bv, sizeof(T));
+}
+
+// Detect "looks like a lexicographic pair": a trivially-copyable class with
+// public `.first` and `.second`, ordered first-then-second (which is exactly
+// what a defaulted operator<=> produces).  Covers pair64, pair_fi, pair_di and
+// std::pair.  We only take this path under the default comparator/projection,
+// where we know the order is lexicographic and can compute the predicate
+// ourselves without the short-circuit branch the struct's operator< emits.
+template <class T>
+concept lex_pair_like = std::is_class_v<T> && std::is_trivially_copyable_v<T> &&
+                        requires(T t) {
+                            t.first;
+                            t.second;
+                        };
 
 }  // namespace detail_cs
 
@@ -130,6 +168,33 @@ template <class T, class Cmp, class Proj>
         a.second = static_cast<i64>(static_cast<std::uint64_t>(a1) ^ d1);
         b.first  = static_cast<i64>(static_cast<std::uint64_t>(b0) ^ d0);
         b.second = static_cast<i64>(static_cast<std::uint64_t>(b1) ^ d1);
+    } else if constexpr (detail_cs::lex_pair_like<T> &&
+                         detail_cs::is_default_less<Cmp, Proj>) {
+        // Generalised branchless lexicographic compare-exchange for any
+        // first/second aggregate under the natural order -- e.g. pair_fi
+        // {float,int} and pair_di {double,int}.  The predicate is computed
+        // without the short-circuit branch the defaulted operator< emits.
+        //
+        // Crucially `lt0` and `eq0` are computed from the SAME operand pair
+        // (b0, a0): the compiler issues a SINGLE compare (one comisd for a
+        // floating first key) and reads both `<` and `==` off its flags
+        // (seta + sete).  Writing the equality as `a0 < b0` instead would be a
+        // second, operand-swapped compare -- doubling the first-key compare
+        // cost, which on pair_di is the whole budget.  Under default IEEE the
+        // floating `==` adds a NaN/parity sequence; `-ffast-math`
+        // (-ffinite-math-only, no NaNs assumed) drops it, so the pair collapses
+        // to one comisd + two set-from-flags.
+        const auto a0 = a.first, a1 = a.second;
+        const auto b0 = b.first, b1 = b.second;
+        const unsigned lt0 = static_cast<unsigned>(b0 < a0);
+        const unsigned eq0 = static_cast<unsigned>(b0 == a0);
+        const unsigned lt1 = static_cast<unsigned>(b1 < a1);
+        const bool swap = (lt0 | (eq0 & lt1)) != 0;
+        if constexpr (sizeof(T) == 16) {
+            detail_cs::half_swap(a, b, swap);
+        } else {
+            detail_cs::word_swap(a, b, swap);
+        }
     } else if constexpr (detail_cs::is_16byte_trivial<T>) {
         // Generic 16-byte type with user comparator.
         const bool swap = comp(proj(b), proj(a));
@@ -560,6 +625,193 @@ template <std::size_t N, class It, class Cmp = std::less<>, class Proj = std::id
 [[gnu::always_inline]] inline void sort_n(It first, Cmp comp = {}, Proj proj = {}) {
     static_assert(N <= 24, "sort_n<N> bounded at 24");
     sort_network<N>(first, comp, proj);
+}
+
+// ===========================================================================
+// Register-blocked runtime-size dispatch (the array length is a *run-time*
+// value, not a template parameter).
+// ===========================================================================
+//
+// libc++'s and AlphaDev's `varsortN` routines get part of their speed from
+// REGISTER BLOCKING: load the whole short run into named locals, run the
+// network with no intermediate memory traffic, then store back.  We generalise
+// that to every best-known network up to N=24: copy the block into a local
+// array `buf[N]` of compile-time size, which the compiler scalar-replaces into
+// registers (after the copy it provably cannot alias the caller's storage), run
+// the network on `buf`, copy back.  Versus sorting in place through the
+// iterator this removes the per-compare-exchange store/reload the optimiser is
+// otherwise forced to keep when it cannot prove non-aliasing -- the effect is
+// largest on pair64, whose every CE writes 16 bytes.
+
+namespace detail {
+template <std::size_t N, class T, class It>
+[[gnu::always_inline]] inline void load_block(T (&buf)[N], It first) {
+    [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+        ((buf[Is] = first[Is]), ...);
+    }(std::make_index_sequence<N>{});
+}
+template <std::size_t N, class T, class It>
+[[gnu::always_inline]] inline void store_block(const T (&buf)[N], It first) {
+    [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+        ((first[Is] = buf[Is]), ...);
+    }(std::make_index_sequence<N>{});
+}
+}  // namespace detail
+
+// Sort one compile-time-size block with register blocking.
+template <std::size_t N, class It, class Cmp, class Proj>
+[[gnu::always_inline]] inline void sort_block_reg(It first, Cmp comp, Proj proj) {
+    using T = typename std::iterator_traits<It>::value_type;
+    T buf[N];
+    detail::load_block<N>(buf, first);
+    sort_network<N>(static_cast<T*>(buf), comp, proj);
+    detail::store_block<N>(buf, first);
+}
+
+// Runtime-size entry point: register-blocked best-known networks, N in [0,24].
+template <class It, class Cmp = std::less<>, class Proj = std::identity>
+inline void sort_reg(It first, It last, Cmp comp = {}, Proj proj = {}) {
+    const auto n = static_cast<std::size_t>(last - first);
+    switch (n) {
+        case 0: case 1: return;
+        case 2:  sort_block_reg<2>(first, comp, proj);  return;
+        case 3:  sort_block_reg<3>(first, comp, proj);  return;
+        case 4:  sort_block_reg<4>(first, comp, proj);  return;
+        case 5:  sort_block_reg<5>(first, comp, proj);  return;
+        case 6:  sort_block_reg<6>(first, comp, proj);  return;
+        case 7:  sort_block_reg<7>(first, comp, proj);  return;
+        case 8:  sort_block_reg<8>(first, comp, proj);  return;
+        case 9:  sort_block_reg<9>(first, comp, proj);  return;
+        case 10: sort_block_reg<10>(first, comp, proj); return;
+        case 11: sort_block_reg<11>(first, comp, proj); return;
+        case 12: sort_block_reg<12>(first, comp, proj); return;
+        case 13: sort_block_reg<13>(first, comp, proj); return;
+        case 14: sort_block_reg<14>(first, comp, proj); return;
+        case 15: sort_block_reg<15>(first, comp, proj); return;
+        case 16: sort_block_reg<16>(first, comp, proj); return;
+        case 17: sort_block_reg<17>(first, comp, proj); return;
+        case 18: sort_block_reg<18>(first, comp, proj); return;
+        case 19: sort_block_reg<19>(first, comp, proj); return;
+        case 20: sort_block_reg<20>(first, comp, proj); return;
+        case 21: sort_block_reg<21>(first, comp, proj); return;
+        case 22: sort_block_reg<22>(first, comp, proj); return;
+        case 23: sort_block_reg<23>(first, comp, proj); return;
+        case 24: sort_block_reg<24>(first, comp, proj); return;
+        default:
+            for (std::size_t i = 1; i < n; ++i)
+                for (std::size_t j = i; j > 0; --j)
+                    cswap(first[j - 1], first[j], comp, proj);
+            return;
+    }
+}
+
+// ===========================================================================
+// `varsort`: faithful port of the libc++/AlphaDev-style routines supplied by
+// the user, for direct head-to-head comparison.  The distinguishing pieces are
+//   (a) `cas`  -- a *generic* ternary-blend compare-exchange (min/max into two
+//                 locals).  Unlike our `cswap` it is NOT specialised for the
+//                 16-byte pair64 lex order, so on pair64 it tests whether the
+//                 plain ternary blend is as good as our hand-tuned path.
+//   (b) `partially_sorted_swap` -- libc++'s 3-input partial sort used by the
+//                 size-3/4/5 routines (fewer ops than a 2-CE decomposition when
+//                 a partial order already holds).
+// Sizes 2..5 use the user's exact routines; 6..24 fall back to our
+// register-blocked best-known networks (also register-blocked, so the only
+// variable at 2..5 is the CE primitive itself).
+// ===========================================================================
+
+template <class T, class Comp, class Proj>
+[[gnu::always_inline]] inline void cas(T& x, T& y, Comp comp, Proj proj) {
+    bool test = std::invoke(comp, std::invoke(proj, x), std::invoke(proj, y));
+    T min_val = test ? x : y;
+    T max_val = test ? y : x;
+    x = min_val;
+    y = max_val;
+}
+
+template <class T, class Comp, class Proj>
+[[gnu::always_inline]] inline void partially_sorted_swap(T& x, T& y, T& z,
+                                                         Comp comp, Proj proj) {
+    // Exact libc++ __partially_sorted_swap, adapted for projection.
+    // Assumes (after projection) that y <= z already.
+    bool r1 = std::invoke(comp, std::invoke(proj, z), std::invoke(proj, x));
+    T tmp   = r1 ? z : x;
+    z       = r1 ? x : z;
+    bool r2 = std::invoke(comp, std::invoke(proj, tmp), std::invoke(proj, y));
+    x       = r2 ? x : y;
+    y       = r2 ? y : tmp;
+}
+
+template <std::size_t N, class It, class Cmp, class Proj>
+[[gnu::always_inline]] inline void varsort_block(It first, Cmp comp, Proj proj) {
+    using T = typename std::iterator_traits<It>::value_type;
+    if constexpr (N == 2) {
+        T x0 = first[0], x1 = first[1];
+        cas(x0, x1, comp, proj);
+        first[0] = x0; first[1] = x1;
+    } else if constexpr (N == 3) {
+        T x0 = first[0], x1 = first[1], x2 = first[2];
+        cas(x0, x1, comp, proj);
+        cas(x1, x2, comp, proj);
+        cas(x0, x1, comp, proj);
+        first[0] = x0; first[1] = x1; first[2] = x2;
+    } else if constexpr (N == 4) {
+        T x0 = first[0], x1 = first[1], x2 = first[2], x3 = first[3];
+        cas(x0, x1, comp, proj);
+        cas(x1, x2, comp, proj);
+        cas(x0, x1, comp, proj);
+        cas(x2, x3, comp, proj);
+        cas(x1, x2, comp, proj);
+        cas(x0, x1, comp, proj);
+        first[0] = x0; first[1] = x1; first[2] = x2; first[3] = x3;
+    } else if constexpr (N == 5) {
+        T x0 = first[0], x1 = first[1], x2 = first[2], x3 = first[3], x4 = first[4];
+        cas(x0, x1, comp, proj);
+        cas(x3, x4, comp, proj);
+        partially_sorted_swap(x2, x3, x4, comp, proj);
+        cas(x1, x4, comp, proj);
+        partially_sorted_swap(x0, x2, x3, comp, proj);
+        partially_sorted_swap(x1, x2, x3, comp, proj);
+        first[0] = x0; first[1] = x1; first[2] = x2; first[3] = x3; first[4] = x4;
+    } else {
+        sort_block_reg<N>(first, comp, proj);
+    }
+}
+
+template <class It, class Cmp = std::less<>, class Proj = std::identity>
+inline void varsort(It first, It last, Cmp comp = {}, Proj proj = {}) {
+    const auto n = static_cast<std::size_t>(last - first);
+    switch (n) {
+        case 0: case 1: return;
+        case 2:  varsort_block<2>(first, comp, proj);  return;
+        case 3:  varsort_block<3>(first, comp, proj);  return;
+        case 4:  varsort_block<4>(first, comp, proj);  return;
+        case 5:  varsort_block<5>(first, comp, proj);  return;
+        case 6:  sort_block_reg<6>(first, comp, proj);  return;
+        case 7:  sort_block_reg<7>(first, comp, proj);  return;
+        case 8:  sort_block_reg<8>(first, comp, proj);  return;
+        case 9:  sort_block_reg<9>(first, comp, proj);  return;
+        case 10: sort_block_reg<10>(first, comp, proj); return;
+        case 11: sort_block_reg<11>(first, comp, proj); return;
+        case 12: sort_block_reg<12>(first, comp, proj); return;
+        case 13: sort_block_reg<13>(first, comp, proj); return;
+        case 14: sort_block_reg<14>(first, comp, proj); return;
+        case 15: sort_block_reg<15>(first, comp, proj); return;
+        case 16: sort_block_reg<16>(first, comp, proj); return;
+        case 17: sort_block_reg<17>(first, comp, proj); return;
+        case 18: sort_block_reg<18>(first, comp, proj); return;
+        case 19: sort_block_reg<19>(first, comp, proj); return;
+        case 20: sort_block_reg<20>(first, comp, proj); return;
+        case 21: sort_block_reg<21>(first, comp, proj); return;
+        case 22: sort_block_reg<22>(first, comp, proj); return;
+        case 23: sort_block_reg<23>(first, comp, proj); return;
+        case 24: sort_block_reg<24>(first, comp, proj); return;
+        default:
+            for (std::size_t i = 1; i < n; ++i)
+                for (std::size_t j = i; j > 0; --j)
+                    cswap(first[j - 1], first[j], comp, proj);
+            return;
+    }
 }
 
 }  // namespace partitions::small_sort

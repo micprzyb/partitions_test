@@ -33,28 +33,38 @@ solution is a **branchless scalar sorting network** that
 
 1. uses the **best-known *size*-optimal network** for each `N` (fewest
    compare-exchanges), and
-2. implements each compare-exchange as a **branchless conditional move**,
-   *including a 2×64-bit cmov decomposition for the 16-byte `pair64`* — which is
-   precisely the case every general-purpose library mishandles.
+2. implements each compare-exchange as a **branchless compare-exchange**, with a
+   key detail: the 16-byte swap must be an **integer XOR-mask blend** (mask = 0
+   or −1) over the two halves, *not* a `cond ? hi : lo` cmov. For any element
+   containing a floating field (`pair_di`), the cmov form is lowered by GCC to a
+   *branch per compare-exchange* (the value lives in XMM, which has no cheap
+   branchless select); the XOR-mask form forces it into GP registers, branch-free.
+   This is precisely the case every general-purpose library mishandles.
 
 That implementation lives in `include/partitions/small_sort.hpp`
 (`small_sort::sort` / `sort_n<N>`). It beats `std::sort`, Boost, and even
-`cpp-sort`'s own network sorter at every size, and the margin is largest on the
-hard case (`pair64`).
+`cpp-sort`'s own network sorter **at every size for every element type tested**;
+the margin is largest on the 16-byte lexicographic pairs.
 
-| N=24, min ns/sort | `int64` | `pair64` |
-|---|---|---|
-| `std::sort` (libstdc++) | 245 | 304 |
-| `boost::pdqsort` | 197 | 291 |
-| `cpp-sort` `sorting_network_sorter` | 33 | **375** |
-| `cpp-sort` `low_moves_sorter` | 270 | 425 |
-| **`small_sort::sort_n` (this repo)** | **28** | **194** |
+| N=24, min ns/sort | `int64` | `pair64`<br>⟨long,long⟩ | `pair_fi`<br>⟨float,int⟩ | `pair_di`<br>⟨double,int⟩ |
+|---|---|---|---|---|
+| `std::sort` (libstdc++) | 245 | 304 | 295 | 295 |
+| `boost::pdqsort` | 197 | 291 | 290 | 306 |
+| `cpp-sort` `sorting_network_sorter` | 33 | 375 | 342 | 366 |
+| **`small_sort::sort_n` (this repo)** | **28** | **190** | **127** | **160** |
 
-The `pair64` column is the headline: `cpp-sort`'s network sorter is *slower than
-`std::sort`* there, because it performs branchy 16-byte swaps. Our network is
-**~1.57× faster than `std::sort`** and **~1.9× faster than `cpp-sort`'s network**.
-(On `int64`, `cpp-sort` and we are both ~7–9× faster than `std::sort`; we hold a
-small edge at every size after the min/max-cmov change described below.)
+The pair columns are the headline: `cpp-sort`'s network sorter is *slower than
+`std::sort`* on every one of them, because it performs branchy 16-byte swaps. Our
+network is **1.6–2.3× faster than `std::sort`**. (On `int64`, `cpp-sort` and we
+are both ~7–9× faster than `std::sort`; we hold a small edge at every size after
+the min/max-cmov change described below.)
+
+> **Element types.** `pair64`=⟨long,long⟩ (16B), `pair_fi`=⟨float,int⟩ (8B),
+> `pair_di`=⟨double,int⟩ (16B, floating first key). `pair<long,int>` is **not**
+> benchmarked: it is also 16B with integer keys, i.e. layout- and
+> behaviour-identical to `pair64`. The pair benchmarks are built `-ffast-math`
+> (no NaNs assumed) so the floating compares drop NaN/unordered handling — a flag
+> applied to the whole TU, so every candidate gets it.
 
 ---
 
@@ -209,6 +219,10 @@ enumeration up to `N=24`) and the existing test suite:
    versus `cpp-sort` at large `N` (N=24: 34→27 ns, now ahead of `cpp-sort`'s 32).
    The dedicated `pair64` path (branchless lex predicate + XOR-mask 2-word swap)
    is unchanged and remains the fastest of all candidates.
+3. **Generalised branchless lexicographic compare-exchange + a branchless
+   16-byte swap, for arbitrary first/second pairs** (`pair_fi`=⟨float,int⟩,
+   `pair_di`=⟨double,int⟩). See the next section — this is where the floating
+   first key forced a subtle codegen fix.
 
 The benchmark (`benchmarks/bench_small_sort.cpp`) was rewritten to drive every
 candidate with a **compile-time `N`** (the regime these algorithms are designed
@@ -257,6 +271,169 @@ build/tools/verify_small_sort                             # prove every network 
 
 (`cpp-sort` is vendored header-only under `third_party/cpp-sort`; clone with
 `git clone --depth 1 https://github.com/Morwenn/cpp-sort third_party/cpp-sort`.)
+
+---
+
+## Other pair shapes: ⟨float,int⟩, ⟨double,int⟩ — and a floating-key codegen trap
+
+The same benchmark sweeps two further lexicographic pairs:
+
+* **`pair_fi` = ⟨float,int⟩**, **8 bytes** — a new (smaller) size class.
+* **`pair_di` = ⟨double,int⟩**, **16 bytes** — same size as `pair64` but a
+  *floating* first key, so the compare is `comisd`, not an integer `cmp`.
+
+`pair<long,int>` is intentionally **omitted**: it is also 16 bytes with integer
+keys, i.e. layout- and behaviour-identical to `pair64`; benchmarking it would
+just reproduce the `pair64` numbers.
+
+To handle these, `cswap` gained a **generalised branchless lexicographic
+compare-exchange** for any trivially-copyable first/second aggregate under the
+natural order: it computes `swap = (b0<a0) | (b0==a0 & b1<a1)` without the
+short-circuit branch the defaulted `operator<` emits. `lt0` and `eq0` are taken
+off **one** compare (same operand pair → `comisd` + `seta` + `sete`).
+
+### The trap (thanks to a reviewer catch)
+
+The first cut put `pair_di` *behind* `std::sort` at large `N` (N=24: 333 vs 295),
+and `-ffast-math` barely helped. The tempting explanation — "the network does
+more FP compares, which are expensive" — is **wrong**: if that were it,
+`-ffast-math` (which cheapens each FP compare) would have helped *us* more than
+`std::sort`, but it helped `std::sort` more. So the cost was not FP-compare
+volume; our path was doing something categorically more expensive.
+
+The disassembly settled it. The N=8 `pair_di` sort contained **33 conditional
+branches** (`jne`/`ja`), ≈ one per compare-exchange — the `pair64` sort had
+**zero**. Cause: with a `double` first field GCC keeps the element in **XMM
+registers**, and the `swap ? hi : lo` form of the 16-byte swap has no cheap
+branchless XMM select, so GCC emits a **branch per compare-exchange**. On random
+data those mispredict and dominate; `-ffast-math` only touches the compare, not
+the branch, which is exactly why it "barely helped."
+
+**Fix:** make the 16-byte swap an **integer XOR-mask blend** over the two halves
+(`mask = 0 or −1`; `a ^= (a^b)&mask`) instead of a cmov/select. That forces the
+swap into GP registers, branch-free, regardless of where the compare keeps the
+value. Result for `pair_di`:
+
+| N=24 `pair_di`, min ns | value |
+|---|---|
+| branchy cmov swap (original) | 333 |
+| **+ branchless XOR-mask swap** | **178** |
+| **+ `-ffast-math`** | **160** |
+
+i.e. the branchless swap is the **1.9×** lever; `-ffast-math` adds a further
+~11%. The same XOR-mask swap is now used for every 16-byte element, so it is
+also the form behind `pair64`.
+
+### Results — `pair_fi` and `pair_di`, compile-time N, min ns/sort
+```
+pair_fi    N=  2    4    8   12   16   20   24
+std::sort        4   16   48   85  140  229  295
+boost::pdqsort   6   19   56  105  163  224  290
+cppsort::network 3   13   42  107  171  254  342
+small_sort::oems 1    7   26   56   81  133  168
+small_sort::best 1    7   22   43   66  100  127
+
+pair_di    N=  2    4    8   12   16   20   24
+std::sort        4   16   49   87  132  224  295
+boost::pdqsort   6   19   58  109  168  235  306
+cppsort::network 3   13   56  112  176  263  366
+small_sort::oems 2    8   29   64   93  155  195
+small_sort::best 2    7   28   58   82  119  160
+```
+
+`small_sort::best` is fastest at every size for both. Interestingly both new
+pairs end up a touch *faster* than `pair64` at large N (N=24: 127 / 160 vs 190) —
+their second key is a 4-byte `int`, so the second-key compare and half of the
+swap are cheaper. The branchless network's dominance is now uniform across
+integer-keyed, float-keyed and double-keyed pairs.
+
+---
+
+## Runtime-size dispatch (length known only at run time)
+
+The tables above use a compile-time `N`. The common real case is "here is a
+pointer and a `size_t` length." `small_sort::sort` / `sort_reg` / `varsort` all
+handle that with a `switch(len)` (a jump table) over `N = 2..24`.
+`benchmarks/bench_small_sort_dyn.cpp` measures it under the same stable protocol
+(≥5M sorts/point, 8 configs), in two regimes:
+
+* **`fixed`** — the length is a run-time value but constant across the data
+  point (the jump-table target is perfectly predicted): isolates per-size cost.
+* **`mix`** — each block's length is random in a range, so the dispatch is
+  **unpredictable**: includes the real cost of the size switch. `mix2_24` =
+  uniform[2,24], plus `mix2_8` and `mix9_24`.
+
+Candidates: `std::sort`, `boost::pdqsort`, `cppsort::net(sw)` (a `switch`
+dispatching to `cpp-sort`'s fixed `sorting_network_sorter<N>` — the fair way to
+use a compile-time-size library at run time), `ss::inplace`
+(`small_sort::sort`, network applied in place through the iterator),
+`ss::regblock` (`small_sort::sort_reg`, **register-blocked**: load the block
+into a local `T buf[N]`, sort in registers, store back), and `varsort`
+(`small_sort::varsort`, a faithful port of the libc++/AlphaDev `cas` +
+`partially_sorted_swap` routines for `N≤5`, delegating to `sort_reg` for `N≥6`).
+
+### Mixed (unpredictable) sizes, uniform[2,24] — min ns/sort
+```
+                 std::sort  pdqsort  cppsort(sw)  ss::inplace  ss::regblock  varsort
+i64                  99.7     96.5        23.3         29.9          30.7      30.1
+pair64              129.3    115.4       152.4         85.9          88.0      88.1
+pair_fi             125.0    134.8       160.8         68.5          73.2      72.9
+pair_di             127.6    103.7       174.2         89.1          99.0      98.1
+```
+Our register-blocked / in-place networks win the unpredictable-size case for
+**every** pair type — including `pair_di`, which before the branchless-swap fix
+was the *slowest* candidate here (194 ns) and is now the fastest (89 ns).
+`cpp-sort`'s switch-dispatched network is worse than `std::sort` on all three
+pairs (branchy 16-byte swaps again); on `int64` it is the fastest by a few ns.
+
+### Fixed run-time `N` — selected sizes, min ns/sort
+```
+pair64  N=          4     8    12    16    20    24
+std::sort          17    51    93   141   234   299
+boost::pdqsort     18    55    97   143   192   264
+cppsort::net(sw)   15    44    82   137   203   275
+ss::inplace         7    27    59    92   143   193
+ss::regblock        7    28    56    96   146   195
+varsort            11    28    57    96   146   195
+```
+
+### What this shows
+
+* **`pair64` (the hard case): our network dispatchers win decisively**, both for
+  a predictable fixed length and for an unpredictable size mix. At `pair64
+  mix2_24` we are **~1.4× faster than Boost** and **~1.75× faster than
+  `cpp-sort`**; on `int64` we and `cpp-sort` are both ~4–6× faster than
+  `std::sort` (cpp-sort edges us by a few ns on the `int64` mix; we edge it on
+  every `pair64` point).
+* **`cpp-sort` is *worse than `std::sort`* on the `pair64` mix** (155 vs 134) —
+  again, branchy 16-byte swaps. The branchless cmov-decomposed compare-exchange
+  is the whole game for `pair64`, and no general library has it.
+* **Register blocking is a modest, honest win — not a silver bullet here.** For
+  raw pointers with the default comparator, GCC 15 already scalar-replaces the
+  in-place network into registers, so `ss::regblock` ≈ `ss::inplace`: blocking
+  helps a few **mid-size `pair64`** points (e.g. N=12: 56 vs 59 ns, by removing
+  intermediate 16-byte stores) and is neutral-to-slightly-negative at large `N`
+  (N=24 spills 384 bytes regardless, so the explicit copy is pure overhead) and
+  for cheap-swap `int64`. Its real value is as a **guarantee**: when the
+  optimiser *cannot* prove non-aliasing (opaque iterators, a comparator that
+  might touch memory), register blocking forces the in-register schedule that
+  the in-place form only gets opportunistically. `ss::inplace` is the best
+  single default; `ss::regblock` is the safe one.
+* **The libc++/AlphaDev `cas` is the wrong primitive for `pair64`.** `varsort`'s
+  generic ternary-blend `cas` is *branchy* on a 16-byte type, so at exactly the
+  sizes it specialises (`N≤5`) it is **2–3× slower** than our branchless `pair64`
+  path: e.g. `pair64` N=2 `varsort` 6 ns vs `ss::inplace` 2 ns; N=5: 20 vs 7.
+  This is the same trap libc++ falls into by gating its branchless `__cond_swap`
+  on `sizeof(T) ≤ sizeof(void*)`. (On `int64`, where the ternary blend *is* a
+  single cmov, `varsort` ties everything — the routines are fine there.)
+
+Reproduce:
+
+```bash
+taskset -c 2 build/benchmarks/bench_small_sort_dyn        # full sweep, CSV
+taskset -c 2 build/benchmarks/bench_small_sort_dyn 12     # single fixed size
+build/tools/verify_small_sort                             # also checks sort_reg + varsort
+```
 
 ---
 

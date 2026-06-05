@@ -56,22 +56,80 @@ bool check_random_i64(int trials = 4096) {
     return true;
 }
 
-template <std::size_t N>
-bool check_random_pair(int trials = 4096) {
-    std::mt19937_64 rng(0xBADC0DEull ^ N);
+template <class P, std::size_t N>
+bool check_random_pairT(const char* name, std::uint64_t salt, int trials = 4096) {
+    std::mt19937_64 rng(0xBADC0DEull ^ N ^ (salt << 24));
     std::uniform_int_distribution<i64> dist(-100, 100);  // many ties
-    std::array<pair64, N> a{}, ref{};
+    std::array<P, N> a{}, ref{};
     for (int t = 0; t < trials; ++t) {
-        for (auto& x : a) x = pair64{dist(rng), dist(rng)};
+        for (auto& x : a) {
+            if constexpr (std::is_same_v<P, pair64>)
+                x = pair64{dist(rng), dist(rng)};
+            else if constexpr (std::is_same_v<P, pair_fi>)
+                x = pair_fi{static_cast<float>(dist(rng)), static_cast<int>(dist(rng))};
+            else
+                x = pair_di{static_cast<double>(dist(rng)), static_cast<int>(dist(rng))};
+        }
         ref = a;
         small_sort::sort_n<N>(a.begin());
         std::sort(ref.begin(), ref.end());
         if (a != ref) {
-            std::printf("N=%zu pair64 trial %d FAILED\n", (std::size_t)N, t);
+            std::printf("N=%zu %s trial %d FAILED\n", (std::size_t)N, name, t);
             return false;
         }
     }
     return true;
+}
+
+template <std::size_t N>
+bool check_random_pair() {
+    return check_random_pairT<pair64, N>("pair64", 0) &&
+           check_random_pairT<pair_fi, N>("pair_fi", 1) &&
+           check_random_pairT<pair_di, N>("pair_di", 2);
+}
+
+// Verify the runtime-size dispatchers (register-blocked `sort_reg` and the
+// libc++/AlphaDev-style `varsort`) against std::sort on random i64 + pair64,
+// across sizes passed as a *run-time* length.
+template <class T, class Fn>
+bool check_runtime(const char* name, std::uint64_t salt, Fn fn, std::size_t n,
+                   int trials = 3000) {
+    std::mt19937_64 rng(0xD15EA5Eull ^ (n << 7) ^ (salt << 20));
+    std::uniform_int_distribution<i64> dist(-50, 50);  // many ties
+    std::vector<T> a(n), ref(n);
+    for (int t = 0; t < trials; ++t) {
+        for (auto& x : a) {
+            if constexpr (std::is_same_v<T, pair64>) x = pair64{dist(rng), dist(rng)};
+            else x = static_cast<T>(dist(rng));
+        }
+        ref = a;
+        fn(a.data(), a.data() + n);
+        std::sort(ref.begin(), ref.end());
+        if (a != ref) {
+            std::printf("%s n=%zu trial %d FAILED\n", name, n, t);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool check_runtime_dispatchers() {
+    bool ok = true;
+    for (std::size_t n = 0; n <= 24; ++n) {
+        ok = check_runtime<i64>("sort_reg/i64", 1, [](i64* a, i64* b) {
+                 small_sort::sort_reg(a, b);
+             }, n) && ok;
+        ok = check_runtime<pair64>("sort_reg/pair64", 2, [](pair64* a, pair64* b) {
+                 small_sort::sort_reg(a, b);
+             }, n) && ok;
+        ok = check_runtime<i64>("varsort/i64", 3, [](i64* a, i64* b) {
+                 small_sort::varsort(a, b);
+             }, n) && ok;
+        ok = check_runtime<pair64>("varsort/pair64", 4, [](pair64* a, pair64* b) {
+                 small_sort::varsort(a, b);
+             }, n) && ok;
+    }
+    return ok;
 }
 
 template <std::size_t... Ns>
@@ -80,6 +138,7 @@ bool run_all_impl(std::index_sequence<Ns...>) {
     ((ok = check_binary<Ns + 2>() && ok), ...);
     ((ok = check_random_i64<Ns + 2>() && ok), ...);
     ((ok = check_random_pair<Ns + 2>() && ok), ...);
+    ok = check_runtime_dispatchers() && ok;
     return ok;
 }
 
