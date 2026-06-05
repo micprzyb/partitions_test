@@ -23,3 +23,6 @@ compile_commands.json
 
 # Local Claude Code settings
 .claude/
+
+# Vendored external deps (fetched, not committed)
+/third_party/

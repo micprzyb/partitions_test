@@ -31,7 +31,17 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build ${{ matrix.pkg }}
+          sudo apt-get install -y ninja-build libboost-dev ${{ matrix.pkg }}
+
+      # Optional: enables bench_small_sort / bench_small_sort_dyn.  If this fails
+      # (e.g. transient network), CMake just skips those two targets -- the rest
+      # of the build is unaffected.
+      - name: Fetch cpp-sort (for the comparison benchmarks)
+        continue-on-error: true
+        run: |
+          rm -rf third_party/cpp-sort
+          git clone --filter=blob:none https://github.com/Morwenn/cpp-sort third_party/cpp-sort
+          git -C third_party/cpp-sort checkout 4e2396811ac61bc9ce6a3373c5f6a98a72bb34ff
 
       - name: Configure
         run: >
@@ -52,6 +62,8 @@ jobs:
           ./build/benchmarks/bench_partition quick   > /dev/null
           ./build/benchmarks/bench_pivot quick        > /dev/null
           ./build/tools/balance_report 20             > /dev/null
+          ./build/tools/verify_small_sort                          # exhaustive 0/1 + key-only
+          ./build/benchmarks/bench_small_merge check               # extend/merge correctness
           echo "tools ran successfully"
 
   format:
