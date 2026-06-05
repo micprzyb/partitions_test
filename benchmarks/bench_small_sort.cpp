@@ -211,14 +211,51 @@ void run_one_size() {
     });
 }
 
+// KEY-ONLY variant: sort the pairs by the FIRST coordinate only (compare the
+// key, carry the whole pair).  std::sort / pdqsort take a by-first comparator;
+// cpp-sort and small_sort take a by-first projection (their native idiom).
+// The algo names are suffixed "/key" so the CSV is one schema.
+template <class T, std::size_t N>
+void run_one_size_key() {
+    std::fprintf(stderr, "  %s/key N=%zu ...\n", type_name<T>(), N);
+    auto by_first = [](const T& x, const T& y) { return x.first < y.first; };
+    auto first_of = [](const T& x) { return x.first; };
+    run<T>("std::sort/key", N, [by_first](T* a, T* b) { std::sort(a, b, by_first); });
+    run<T>("boost::pdqsort/key", N,
+           [by_first](T* a, T* b) { boost::sort::pdqsort(a, b, by_first); });
+    run<T>("cppsort::network/key", N, [first_of](T* a, T* b) {
+        cppsort::sorting_network_sorter<N>{}(a, b, std::less<>{}, first_of);
+    });
+    run<T>("small_sort::best/key", N, [first_of](T* a, T* b) {
+        (void)b;
+        small_sort::sort_n<N>(a, std::less<>{}, first_of);
+    });
+    run<T>("small_sort::oems/key", N, [first_of](T* a, T* b) {
+        (void)b;
+        small_sort::sort_network_oems<N>(a, std::less<>{}, first_of);
+    });
+}
+
 template <class T, std::size_t... Ns>
 void run_type_impl(std::index_sequence<Ns...>, std::size_t only_n) {
     ((only_n == 0 || only_n == Ns + 2 ? run_one_size<T, Ns + 2>() : void()), ...);
 }
 
+template <class T, std::size_t... Ns>
+void run_type_key_impl(std::index_sequence<Ns...>, std::size_t only_n) {
+    ((only_n == 0 || only_n == Ns + 2 ? run_one_size_key<T, Ns + 2>() : void()), ...);
+}
+
 template <class T>
 void run_type(std::size_t only_n) {
     run_type_impl<T>(std::make_index_sequence<23>{}, only_n);
+}
+
+// Lexicographic sweep + key-only sweep (pairs only).
+template <class T>
+void run_type_with_key(std::size_t only_n) {
+    run_type_impl<T>(std::make_index_sequence<23>{}, only_n);
+    run_type_key_impl<T>(std::make_index_sequence<23>{}, only_n);
 }
 
 }  // namespace
@@ -228,9 +265,10 @@ int main(int argc, char** argv) {
     if (argc > 1) only_n = static_cast<std::size_t>(std::strtoull(argv[1], nullptr, 10));
     std::printf("type,algo,n,total_sorts,samples,min_ns,p50_ns,p90_ns,mean_ns,cv_pct\n");
     run_type<i64>(only_n);
-    run_type<pair64>(only_n);     // pair<long,long>, 16B
-    run_type<pair_li>(only_n);    // pair<long,int>,  16B, narrow second key
-    run_type<pair_fi>(only_n);    // pair<float,int>,  8B
-    run_type<pair_di>(only_n);    // pair<double,int>, 16B, floating first key
+    // Pairs: lexicographic (both coords) AND key-only (compare .first, carry .second).
+    run_type_with_key<pair64>(only_n);   // pair<long,long>, 16B
+    run_type_with_key<pair_li>(only_n);  // pair<long,int>,  16B
+    run_type_with_key<pair_fi>(only_n);  // pair<float,int>,  8B
+    run_type_with_key<pair_di>(only_n);  // pair<double,int>, 16B, floating first key
     return 0;
 }

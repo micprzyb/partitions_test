@@ -398,6 +398,63 @@ faster than `cpp-sort` regardless.
 
 ---
 
+## Sort by key only (compare `.first`, carry `.second`)
+
+A very common variant: the pair is a **(key, payload)** record — order is decided
+by the **first coordinate only**, but the whole element must move with it. This
+is exactly a **projection**: compare `proj(x) = x.first`, move all of `x`.
+
+This needs no new algorithm — it is the projection the library already threads
+through every path (`small_sort::sort_n<N>(first, std::less<>{}, &T::first)`).
+The only fix required was making the **8-byte** case branchless too: an 8-byte
+record with a custom projection used to hit the generic `swap ? b : a` fallback
+(a potential branch); it now uses the XOR-mask `word_swap`, matching the 16-byte
+`half_swap`. Verified branch-free by disassembly and correct by the verifier
+(keys non-decreasing + multiset preserved, all sizes, all four pair types).
+
+**Can we optimize for this case? Yes — and it falls out for free.** A by-key
+compare-exchange does exactly **one** key compare (vs two/three for the
+lexicographic order: `lt0`, `eq0`, and the second-key `lt1`), while the swap is
+unchanged. So sorting a pair *by key* is **~50% faster** than sorting it
+*lexicographically*, across the board:
+
+```
+small_sort::best, min ns/sort   N=  4    8   12   16   20   24
+pair64   lexicographic              5   19   39   59   98  122
+pair64   by .first only             3    8   18   29   45   62     (~50% faster)
+pair_di  lexicographic              7   28   58   82  119  163
+pair_di  by .first only             5   15   29   40   60   80     (~50% faster)
+```
+(`pair64` by-key at N=24 is 62 ns — only ~2.3× a bare `int64` sort despite
+carrying an extra 8-byte payload through every move.)
+
+**And our lead over the other libraries *grows* here — to ~3.5–4×**, because the
+cheaper compare exposes the swap, which is exactly where the branchless cmov
+beats everyone's branchy 16-byte swap:
+
+```
+key-only (by .first), min ns/sort      std::sort  pdqsort  cpp-sort  small_sort
+pair64   N=16                              106.6    115.1     112.3        29.2
+pair64   N=24                              245.7    214.2     230.9        62.3
+pair_di  N=24                              277.4    239.9     260.9        79.9
+```
+
+* **`std::sort` / Boost** take a by-`.first` *comparator* (no projection API);
+  they still do branchy 3-move swaps — now the dominant cost, so they fall to
+  **~4× behind**.
+* **`cpp-sort`** has the same ergonomics as us (native *projection* support, so
+  you pass `&T::first`), and its compare gets cheaper too — but its 16-byte swap
+  is still branchy, leaving it ~3.5–4× behind.
+* **Limits of "carry the payload".** Moving the payload *inside* the
+  compare-exchange is optimal only while the element is small (a few words). For
+  a **large** payload the move cost would dominate the network's many swaps, and
+  the right move flips to sorting `(key, index)` pairs and permuting the payload
+  **once** at the end. For ≤16-byte records (the case here) the direct branchless
+  move wins comfortably — index-indirection would add a second array and a
+  scatter for no benefit.
+
+---
+
 ## Runtime-size dispatch (length known only at run time)
 
 The tables above use a compile-time `N`. The common real case is "here is a
@@ -436,6 +493,20 @@ was the *slowest* candidate here (194 ns) and is now among the fastest (89 ns).
 `pair_li` ties `pair64` exactly here (87.0 / 87.0). `cpp-sort`'s switch-dispatched
 network is worse than `std::sort` on all four pairs (branchy 16-byte swaps
 again); on `int64` it is the fastest by a few ns.
+
+> **Caveat — this mixed number is frontend-bound, not compute-bound.** With
+> *unpredictable* sizes, each sort jumps to one of 23 fully-unrolled networks, so
+> the cost is dominated by switch-mispredict + L1-instruction-cache thrashing,
+> not by the per-sort arithmetic. Concretely, for `pair64` the fixed per-size
+> average over N=9..24 is ~69 ns but `mix9_24` measures ~116 ns — ~47 ns/sort of
+> pure dispatch/frontend overhead. Because that overhead is set by (unchanged)
+> code size, the big per-size wins (e.g. the `pair64` dedicated-path removal,
+> fixed N=24: 191→118 ns) are **largely invisible in this table** and show up in
+> the fixed-size / compile-time numbers instead. They *do* surface here for the
+> small-size mix, where the networks are small and frontend pressure is low
+> (`pair64` `mix2_8`: 18.1→15.4 ns after the fix). The mixed numbers are a fair
+> picture of the *unpredictable-size* regime; they are not where per-CE compute
+> improvements show.
 
 ### Fixed run-time `N` (`pair64`) — selected sizes, min ns/sort
 ```

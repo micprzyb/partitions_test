@@ -198,6 +198,15 @@ template <class T, class Cmp, class Proj>
         const T hi = swap ? a : b;
         a = lo;
         b = hi;
+    } else if constexpr (std::is_trivially_copyable_v<T> && sizeof(T) == 8) {
+        // 8-byte trivially-copyable aggregate with a custom comparator/projection
+        // -- e.g. pair_fi {float,int} sorted *by .first only* (compare the key,
+        // carry the whole pair).  The plain `swap ? b : a` ternary on such a
+        // struct can be lowered to a branch (the value may sit in an XMM reg);
+        // the XOR-mask word_swap forces a branchless GP-register swap, matching
+        // the 16-byte half_swap path one size down.
+        const bool swap = comp(proj(b), proj(a));
+        detail_cs::word_swap(a, b, swap);
     } else {
         // Generic fallback.
         const bool swap = comp(proj(b), proj(a));

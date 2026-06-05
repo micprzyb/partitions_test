@@ -91,6 +91,55 @@ bool check_random_pair() {
            check_random_pairT<pair_di, N>("pair_di", 2);
 }
 
+// Key-only: sort by .first (carry .second).  After sort_n with a by-first
+// projection, the keys must be non-decreasing AND the multiset of full elements
+// must be preserved (the network is not stable, so we only require those two).
+template <class P, std::size_t N>
+bool check_keyonly(const char* name, std::uint64_t salt, int trials = 4096) {
+    std::mt19937_64 rng(0x5E0011ull ^ N ^ (salt << 17));
+    std::uniform_int_distribution<i64> dist(-40, 40);  // many key ties
+    auto first_of = [](const P& x) { return x.first; };
+    std::array<P, N> a{}, ref{};
+    for (int t = 0; t < trials; ++t) {
+        for (auto& x : a) {
+            if constexpr (std::is_same_v<P, pair64>)
+                x = pair64{dist(rng), dist(rng)};
+            else if constexpr (std::is_same_v<P, pair_li>)
+                x = pair_li{static_cast<long>(dist(rng)), static_cast<int>(dist(rng))};
+            else if constexpr (std::is_same_v<P, pair_fi>)
+                x = pair_fi{static_cast<float>(dist(rng)), static_cast<int>(dist(rng))};
+            else
+                x = pair_di{static_cast<double>(dist(rng)), static_cast<int>(dist(rng))};
+        }
+        ref = a;
+        small_sort::sort_n<N>(a.begin(), std::less<>{}, first_of);
+        for (std::size_t i = 1; i < N; ++i) {
+            if (a[i].first < a[i - 1].first) {
+                std::printf("N=%zu %s/key trial %d FAILED (keys out of order)\n",
+                            (std::size_t)N, name, t);
+                return false;
+            }
+        }
+        // Multiset preserved: sort both fully and compare.
+        std::sort(a.begin(), a.end());
+        std::sort(ref.begin(), ref.end());
+        if (a != ref) {
+            std::printf("N=%zu %s/key trial %d FAILED (lost elements)\n",
+                        (std::size_t)N, name, t);
+            return false;
+        }
+    }
+    return true;
+}
+
+template <std::size_t N>
+bool check_keyonly_all() {
+    return check_keyonly<pair64, N>("pair64", 0) &&
+           check_keyonly<pair_li, N>("pair_li", 3) &&
+           check_keyonly<pair_fi, N>("pair_fi", 1) &&
+           check_keyonly<pair_di, N>("pair_di", 2);
+}
+
 // Verify the runtime-size dispatchers (register-blocked `sort_reg` and the
 // libc++/AlphaDev-style `varsort`) against std::sort on random i64 + pair64,
 // across sizes passed as a *run-time* length.
@@ -141,6 +190,7 @@ bool run_all_impl(std::index_sequence<Ns...>) {
     ((ok = check_binary<Ns + 2>() && ok), ...);
     ((ok = check_random_i64<Ns + 2>() && ok), ...);
     ((ok = check_random_pair<Ns + 2>() && ok), ...);
+    ((ok = check_keyonly_all<Ns + 2>() && ok), ...);
     ok = check_runtime_dispatchers() && ok;
     return ok;
 }
