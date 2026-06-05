@@ -132,6 +132,34 @@ void run_n(std::size_t delta) {
         std::copy(buf, buf + N, a);
     });
 
+    // ---- KEY-ONLY (pairs): compare `.first` only, carry the whole pair. The
+    // prefix/tail are pre-sorted *by .first*; routines take a by-first projection
+    // (ours / the network) or a by-first comparator (std). Algo names suffixed
+    // "/key" so the CSV stays one schema. ----
+    if constexpr (requires(T x) { x.first; }) {
+        auto byf = [](const T& x, const T& y) { return x.first < y.first; };
+        auto fof = [](const T& x) { return x.first; };
+        auto less = std::less<>{};
+        auto pa = [k, byf](T* b) { std::sort(b, b + k, byf); };
+        auto pb = [k, byf](T* b) { std::sort(b, b + k, byf); std::sort(b + k, b + N, byf); };
+        add("a", "extend_sorted/key", pa,
+            [k, less, fof](T* a) { small_merge::extend_sorted(a, k, N, less, fof); });
+        add("a", "sort_network/key", pa,
+            [less, fof](T* a) { small_sort::sort_n<N>(a, less, fof); });
+        add("a", "std::sort/key", pa, [byf](T* a) { std::sort(a, a + N, byf); });
+        add("b", "extend_sorted/key", pb,
+            [k, less, fof](T* a) { small_merge::extend_sorted(a, k, N, less, fof); });
+        add("b", "merge_sorted/key", pb,
+            [k, less, fof](T* a) { small_merge::merge_sorted(a, k, N, less, fof); });
+        add("b", "std::merge/key", pb, [k, byf](T* a) {
+            T buf[24];
+            std::merge(a, a + k, a + k, a + N, buf, byf);
+            std::copy(buf, buf + N, a);
+        });
+        add("b", "sort_network/key", pb,
+            [less, fof](T* a) { small_sort::sort_n<N>(a, less, fof); });
+    }
+
     const std::size_t C = run.size();
     const std::uint64_t R = std::max<std::uint64_t>((kMinTotalOps + batch - 1) / batch, 50);
     std::vector<std::vector<double>> samp(C);
@@ -197,6 +225,23 @@ bool check() {
             small_merge::merge_sorted(w.data(), k, N); if (!chk("b merge")) return false;
             w = base; std::sort(w.begin(), w.begin() + k); std::sort(w.begin() + k, w.end());
             small_merge::merge_sorted_branchless(w.data(), k, N); if (!chk("b bl")) return false;
+            // key-only (pairs): sort by .first, carry .second
+            if constexpr (requires(T x) { x.first; }) {
+                auto byf = [](const T& x, const T& y) { return x.first < y.first; };
+                auto fof = [](const T& x) { return x.first; };
+                auto keyok = [&](const char* nm) {
+                    for (std::size_t i = 1; i < N; ++i)
+                        if (w[i].first < w[i - 1].first) { std::printf("%s/key fail N=%zu k=%zu (order)\n", nm, N, k); return false; }
+                    std::vector<T> r = base, s = w;
+                    std::sort(r.begin(), r.end()); std::sort(s.begin(), s.end());
+                    if (r != s) { std::printf("%s/key fail N=%zu k=%zu (multiset)\n", nm, N, k); return false; }
+                    return true;
+                };
+                w = base; std::sort(w.begin(), w.begin() + k, byf);
+                small_merge::extend_sorted(w.data(), k, N, std::less<>{}, fof); if (!keyok("a extend")) return false;
+                w = base; std::sort(w.begin(), w.begin() + k, byf); std::sort(w.begin() + k, w.end(), byf);
+                small_merge::merge_sorted(w.data(), k, N, std::less<>{}, fof); if (!keyok("b merge")) return false;
+            }
         }
     }
     return true;

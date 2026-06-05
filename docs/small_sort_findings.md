@@ -536,6 +536,30 @@ case b extend_sorted  16  32  46  59            18  35  49  64
   unconditional compare-selects lose to the early-exit merge at small δ and to the
   network otherwise.
 
+### Key-only (compare `.first`, carry the pair)
+
+The benchmark also runs every pair candidate in **key-only** mode (`/key`): order
+by `.first` only via a projection (ours / the network) or a by-`.first`
+comparator (`std`), with the prefix/tail pre-sorted by key. It is faster than the
+lexicographic order for every routine, by a margin that tracks how compare-bound
+each one is (the 16-byte move is unchanged):
+
+```
+pair64 n=24, lex / key   δ1      δ2      δ3      δ4
+a extend_sorted          15/14   33/27   45/41   62/51      (~10-18% faster)
+a sort_network          124/64  124/64  124/65  124/63      (~48% faster: compare-bound)
+b extend_sorted          16/14   32/25   46/38   59/47
+b merge_sorted           22/19   34/29   45/39   53/47
+```
+
+The **network gains most** (~48%) — every compare-exchange does a compare, so
+halving the compare cost (no second-key tie-break) shows up directly. **Insertion
+gains least** (~10-18%) because its cost is dominated by the 16-byte shifts, not
+the compare. The ranking is unchanged: `extend_sorted/key` still wins the
+almost-sorted regime for pairs (n=24 δ4: 51 vs the network's 63). Key-only
+correctness (keys non-decreasing + multiset preserved) is checked for
+`extend_sorted` and `merge_sorted` in `bench_small_merge check`.
+
 ### Assembler investigation — two "optimisations" that backfire
 
 The disassembly of the `pair64` insertion inner loop shows a branchy lex compare
