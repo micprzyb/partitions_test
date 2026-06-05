@@ -455,6 +455,125 @@ pair_di  N=24                              277.4    239.9     260.9        79.9
 
 ---
 
+## Almost-sorted blocks: extend a sorted prefix / merge two sorted runs
+
+When most of the block is already sorted (`n − k` small — the introsort / adaptive
+regime), re-sorting from scratch is wasteful. `include/partitions/small_merge.hpp`
+adds two routines (and is benchmarked by `bench_small_merge`, ≥5M ops/point):
+
+* **case (a) `extend_sorted`** — `[0,k)` sorted, `[k,n)` unsorted: insert each
+  tail element into the sorted prefix (shift-based insertion started at `i=k`).
+* **case (b) `merge_sorted`** — `[0,k)` *and* `[k,n)` sorted: copy the small tail
+  to a stack buffer, merge right-to-left, exit when the tail drains (the timsort
+  "copy the smaller run" trick). Also `merge_sorted_branchless` (fixed `n`-trip).
+
+The target is `δ = n − k ∈ {1,2,3,4}` (k close to n); the full δ sweep is in the
+CSV.
+
+### Methodology: a measurement bug, and the fix (round-robin)
+
+The first version of this benchmark timed each candidate in its own long loop,
+then compared absolute numbers across candidates that ran *seconds apart*. That is
+**biased**: the per-call `min` is stable, but the absolute level drifts over a
+program's lifetime (frequency scaling, allocator state from `std::inplace_merge`'s
+temp buffer, cache left by neighbours). The tell: at **δ = 1** cases (a) and (b)
+are the *identical* operation on *identical* data (the tail is one element), yet
+the old harness reported up to **±30 %** difference between them — pure drift, the
+same magnitude as the real effect, which it masked and sometimes reversed. (Credit
+to a reviewer for spotting that a sorted tail should, if anything, be *faster*.)
+
+The fixed harness measures all candidates for a given `(n, δ)` **round-robin** — in
+each round every candidate is timed once — so drift hits them equally and all
+share one random value set (only the prep differs). At δ = 1 cases (a)/(b) now
+match within ±1–4 %. (Absolute numbers also rise vs the old loop, which kept a
+single candidate hot in L1; the round-robin's realistic cache pressure is the
+honest figure. Relative rankings are what matter and are now unbiased.)
+
+### Corrected results — min ns/op (round-robin, ≥5M ops/point)
+
+```
+                       pair64  n=24              i64    n=24
+                    δ1  δ2  δ3  δ4            δ1  δ2  δ3  δ4
+case a extend_sorted  16  32  48  64            18  37  55  77
+       sort_network  124 124 124 124            28  28  28  28
+       std::sort      73  98 123 146            45  64  85 103
+case b extend_sorted  16  32  46  59            18  35  49  64
+       merge_sorted   22  34  44  52            13  22  29  36
+       std::merge     23  36  46  54            17  27  33  40
+       sort_network  124 124 124 124            28  28  28  28
+```
+
+### What wins, and why
+
+* **A sorted tail is genuinely faster for insertion** (case b vs case a, same
+  algorithm) — exactly as expected, and now measured correctly. A sorted tail has
+  no tail-internal inversions, so left-to-right insertion never shifts one tail
+  element past another. The shift count confirms it (n=24: δ4 → 40.0 moves sorted
+  vs 43.0 unsorted; δ1 identical 11.47/11.47), and the timing follows (case b
+  `extend_sorted` n=24 δ4: 59 vs case a 64; i64 n=24 δ4: 64 vs 77). The gap grows
+  with δ; at δ = 1 the two are identical (one-element tail).
+* **Expensive element (`pair64`): insertion dominates case (a).** `extend_sorted`
+  beats the best-known **sorting network by 2–8×** across the whole target regime
+  and out to δ ≈ 8 (n=24 δ4: 64 vs 124; δ1: 16 vs 124). The network pays for
+  ~`n·log²n` 16-byte swaps no matter how sorted the input is; insertion pays only
+  for the elements actually out of place.
+* **Cheap element (`int64`): the branchless network is near-unbeatable.** Its swap
+  is a single cmov, so re-sorting all of it (28 ns, data-independent) beats
+  insertion for case (a) at every δ ≥ 1 (only ties at δ = 1). Exploiting the
+  sorted prefix barely helps when moves are this cheap.
+* **Case (b), expensive element:** `extend_sorted` wins the tiny-δ end (δ ≤ 2:
+  insertion 32 ≈ merge 34 at δ2; insertion 16 < merge 22 at δ1 — the merge's
+  tail-copy + bookkeeping isn't worth it for 1–2 elements), and `merge_sorted` /
+  `std::merge` take over at δ ≥ 3 (n=24 δ4: merge 52 vs insertion 59), where
+  insertion's `O(δ·n)` shifts exceed the merge's single `O(n)` pass.
+* **Case (b), cheap element (`int64`): the copy-tail merge wins.** `merge_sorted`
+  (13/22/29/36) beats insertion, `std::merge`, `std::inplace_merge`, and the
+  network for δ ≤ 3 — here the `O(n)` merge with cheap moves finally pays off and
+  the tail-copy is cheap.
+* **vs the most efficient mergers.** Our `merge_sorted` ≥ `std::merge`
+  (out-of-place + copy back) and both beat `std::inplace_merge` (in-place merging
+  is harder). The **fixed-trip branchless merge is never best** — its `n`
+  unconditional compare-selects lose to the early-exit merge at small δ and to the
+  network otherwise.
+
+### Assembler investigation — two "optimisations" that backfire
+
+The disassembly of the `pair64` insertion inner loop shows a branchy lex compare
+plus a 16-byte `vmovdqu` move per shifted element. Two natural "improvements"
+were tried and **both lost** — the instructive part:
+
+* **Binary search + memmove** (`extend_sorted_bsearch`): replace the linear scan
+  with `log₂i` compares and one bulk `memmove`. *Slower* — the linear scan's
+  shift loop is a **monotone, well-predicted** branch (one mispredict at the exit
+  no matter how far it scans), whereas binary search makes ~`log₂i`
+  **unpredictable** branches (~50 % mispredict each). For n ≤ 24 those mispredicts
+  cost far more than the extra cheap moves.
+* **Linear scan + bulk memmove** (`extend_sorted_scan`): keep the predictable scan
+  but move the gap with one `memmove` instead of i/2 element moves. Also *slower*
+  — the shift width is a **runtime** value, so the compiler emits a generic
+  `memmove` (size dispatch + `rep movs` startup) rather than a fixed-size SIMD
+  copy, and in the interleaved form the moves already execute **underneath the
+  compares via out-of-order ILP**, so there is no serial move cost to remove.
+
+Conclusion: the naive interleaved linear insertion is already optimal for this
+size/branch profile — the assembler study *confirmed* it and killed the two
+obvious alternatives with concrete reasons (predictable branch + ILP overlap +
+variable-size memmove startup). Both rejected variants are kept in the header,
+clearly commented as negative results.
+
+### Recommendation
+
+* **Expensive elements (`pair64`-like), `n − k ≤ 4`:** use `extend_sorted` for
+  case (a) (beats the network 2–8×). For case (b), `extend_sorted` at δ ≤ 2,
+  `merge_sorted` at δ ≥ 3.
+* **Cheap elements (`int64`-like):** just re-sort with the **sorting network** for
+  case (a) — exploiting the prefix doesn't pay. For case (b) use `merge_sorted`
+  (δ ≤ 3), else the network.
+* In all cases a **sorted** tail (case b) is cheaper than an unsorted one (case a)
+  for insertion — if you can keep incremental input sorted, do.
+
+---
+
 ## Runtime-size dispatch (length known only at run time)
 
 The tables above use a compile-time `N`. The common real case is "here is a

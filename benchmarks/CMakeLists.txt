@@ -2,7 +2,7 @@
 # disabled).  They deliberately do NOT link the strict-warning interface: the
 # (unsigned long long) printf casts etc. are benchmark-local noise.
 
-foreach(bench_src bench_partition.cpp bench_pivot.cpp bench_large_n.cpp bench_small_sort.cpp bench_small_sort_dyn.cpp)
+foreach(bench_src bench_partition.cpp bench_pivot.cpp bench_large_n.cpp bench_small_sort.cpp bench_small_sort_dyn.cpp bench_small_merge.cpp)
     get_filename_component(bench_name ${bench_src} NAME_WE)
     add_executable(${bench_name} ${bench_src})
     target_include_directories(${bench_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
