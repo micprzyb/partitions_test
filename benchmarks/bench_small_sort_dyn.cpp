@@ -105,6 +105,8 @@ template <class T, class Rng, class Dist>
 T make_elem(Rng& rng, Dist& dist) {
     if constexpr (std::is_same_v<T, pair64>)
         return pair64{dist(rng), dist(rng)};
+    else if constexpr (std::is_same_v<T, pair_li>)
+        return pair_li{static_cast<long>(dist(rng)), static_cast<int>(dist(rng))};
     else if constexpr (std::is_same_v<T, pair_fi>)
         return pair_fi{static_cast<float>(dist(rng)), static_cast<int>(dist(rng))};
     else if constexpr (std::is_same_v<T, pair_di>)
@@ -242,8 +244,8 @@ int main(int argc, char** argv) {
                 "min_ns,p50_ns,p90_ns,mean_ns,cv_pct\n");
     run_type<i64>(only_n);
     run_type<pair64>(only_n);   // pair<long,long>, 16B
+    run_type<pair_li>(only_n);  // pair<long,int>,  16B
     run_type<pair_fi>(only_n);  // pair<float,int>,  8B
     run_type<pair_di>(only_n);  // pair<double,int>, 16B, floating first key
-    // pair<long,int> omitted: 16B integer-keyed == pair64.
     return 0;
 }

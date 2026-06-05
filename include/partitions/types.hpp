@@ -47,9 +47,18 @@ static_assert(sizeof(pair64) == 16);
 //                             first key, so the compare is a comiss/ucomisd, not
 //                             an integer cmp.
 //
-// We deliberately do NOT add pair<long,int>: it is also 16 bytes with integer
-// keys, i.e. layout- and behaviour-identical to pair64, so benchmarking it
-// would just reproduce the pair64 numbers (see docs/small_sort_findings.md).
+// pair_li {long,int} (16 bytes, 4 padding) is included after all: although it is
+// the same size as pair64, its second key is a 4-byte int, so the second-key
+// compare is narrower -- a direct test of whether the win on pair_di comes from
+// the (int) second key or the (double) first key.
+struct pair_li {
+    long first{};
+    int second{};
+    friend constexpr bool operator==(const pair_li&, const pair_li&) = default;
+    friend constexpr auto operator<=>(const pair_li&, const pair_li&) = default;
+};
+static_assert(sizeof(pair_li) == 16);
+
 struct pair_fi {
     float first{};
     int second{};
@@ -90,6 +99,7 @@ constexpr const char* type_name() {
     if constexpr (std::is_same_v<T, i32>) return "i32";
     else if constexpr (std::is_same_v<T, i64>) return "i64";
     else if constexpr (std::is_same_v<T, pair64>) return "pair64";
+    else if constexpr (std::is_same_v<T, pair_li>) return "pair_li";
     else if constexpr (std::is_same_v<T, pair_fi>) return "pair_fi";
     else if constexpr (std::is_same_v<T, pair_di>) return "pair_di";
     else if constexpr (std::is_same_v<T, keyed>) return "keyed";

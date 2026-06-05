@@ -65,6 +65,8 @@ bool check_random_pairT(const char* name, std::uint64_t salt, int trials = 4096)
         for (auto& x : a) {
             if constexpr (std::is_same_v<P, pair64>)
                 x = pair64{dist(rng), dist(rng)};
+            else if constexpr (std::is_same_v<P, pair_li>)
+                x = pair_li{static_cast<long>(dist(rng)), static_cast<int>(dist(rng))};
             else if constexpr (std::is_same_v<P, pair_fi>)
                 x = pair_fi{static_cast<float>(dist(rng)), static_cast<int>(dist(rng))};
             else
@@ -84,6 +86,7 @@ bool check_random_pairT(const char* name, std::uint64_t salt, int trials = 4096)
 template <std::size_t N>
 bool check_random_pair() {
     return check_random_pairT<pair64, N>("pair64", 0) &&
+           check_random_pairT<pair_li, N>("pair_li", 3) &&
            check_random_pairT<pair_fi, N>("pair_fi", 1) &&
            check_random_pairT<pair_di, N>("pair_di", 2);
 }
