@@ -17,18 +17,23 @@
 // stated purely in terms of the key, the by-key form needs no element to
 // actually equal the pivot.
 //
-// All four forms reduce to a single partition-by-predicate call on the supplied
-// algorithm.  The only thing that varies is the predicate:
+// All four forms reduce to a single call on the algorithm's pivot+comp+proj
+// primitive (concepts.hpp).  The only thing that varies is the comparator:
 //
 //                       left group              returns (middle m)
-//   forward    : keep_left(x) =  comp(proj(x), pivot)   [first,m) <  pivot
-//   reverse    : keep_left(x) = !comp(proj(x), pivot)   [first,m) >= pivot
+//   forward    : comp        (x < pivot)        [first,m) <  pivot
+//   reverse    : ge = !comp  (x >= pivot)       [first,m) >= pivot
+//
+// The reverse form works because a partition only ever evaluates the comparator
+// against the single fixed pivot, i.e. as a unary predicate -- so the negated
+// comparator `ge(a,b) = !comp(a,b)` (not itself a strict-weak order, but that
+// is irrelevant here) flips exactly which side each element lands on.
 //
 // "Pivot by key" takes the pivot value directly (it need not occur in the
-// block).  "Pivot by position" takes an iterator into the block and reads the
-// key once, up front, into a stable local copy -- so the element it points at
-// may be moved freely during partitioning (and the position may come from a
-// reordering pivot strategy).
+// block).  "Pivot by position" takes an iterator into the block; if the
+// algorithm offers a position-aware fast path (`alg.at(...)`, e.g. one that uses
+// the pivot element as a sentinel) it is used, otherwise the key is read once,
+// up front, into a stable local copy.
 //
 // comp is a strict-weak-ordering "less".  Note that ">= pivot" is expressed as
 // "not (x < pivot)", so a single comparator drives both the strict (<) and
@@ -42,6 +47,16 @@
 
 namespace partitions {
 
+namespace detail {
+// The negated comparator used to express a reverse partition: ge(a,b) = !(a<b).
+template <class Comp>
+auto negate_comp(Comp comp) {
+    return [comp = std::move(comp)](const auto& a, const auto& b) {
+        return !static_cast<bool>(std::invoke(comp, a, b));
+    };
+}
+}  // namespace detail
+
 // ----- forward partition: [smaller than pivot | >= pivot] ------------------
 
 // Pivot given as a key value (may be absent from the block).
@@ -49,14 +64,12 @@ template <class Alg, std::random_access_iterator I, std::sentinel_for<I> S,
           class Key, class Comp = std::less<>, class Proj = std::identity>
 I partition_by_key(Alg alg, I first, S last, const Key& pivot, Comp comp = {},
                    Proj proj = {}) {
-    return alg(first, last, [&](const auto& x) {
-        return static_cast<bool>(std::invoke(comp, std::invoke(proj, x), pivot));
-    });
+    return alg(first, last, pivot, comp, proj);
 }
 
 // Pivot given as a position.  If the algorithm offers a position-aware fast
 // path (`alg.at(...)`, e.g. one that uses the pivot element as a sentinel), it
-// is used; otherwise the key is captured up front and the predicate path runs.
+// is used; otherwise the key is captured up front and the value path runs.
 template <class Alg, std::random_access_iterator I, std::sentinel_for<I> S,
           class Comp = std::less<>, class Proj = std::identity>
 I partition_by_position(Alg alg, I first, S last, I pivot, Comp comp = {},
@@ -65,10 +78,7 @@ I partition_by_position(Alg alg, I first, S last, I pivot, Comp comp = {},
         return alg.at(first, last, pivot, comp, proj);
     } else {
         auto pivot_key = std::invoke(proj, *pivot);  // stable copy
-        return alg(first, last, [&](const auto& x) {
-            return static_cast<bool>(
-                std::invoke(comp, std::invoke(proj, x), pivot_key));
-        });
+        return alg(first, last, pivot_key, comp, proj);
     }
 }
 
@@ -78,16 +88,13 @@ template <class Alg, std::random_access_iterator I, std::sentinel_for<I> S,
           class Key, class Comp = std::less<>, class Proj = std::identity>
 I reverse_partition_by_key(Alg alg, I first, S last, const Key& pivot,
                            Comp comp = {}, Proj proj = {}) {
-    return alg(first, last, [&](const auto& x) {
-        return !static_cast<bool>(
-            std::invoke(comp, std::invoke(proj, x), pivot));
-    });
+    return alg(first, last, pivot, detail::negate_comp(comp), proj);
 }
 
 // Reverse partition by position.  A reverse partition is a forward partition
 // performed over the reversed range, so a position-aware `alg.at` is reused on
 // reverse iterators and the boundary is mapped back with `.base()`; otherwise
-// the predicate path runs.
+// the value path runs with the negated comparator.
 template <class Alg, std::random_access_iterator I, std::sentinel_for<I> S,
           class Comp = std::less<>, class Proj = std::identity>
 I reverse_partition_by_position(Alg alg, I first, S last, I pivot,
@@ -103,10 +110,7 @@ I reverse_partition_by_position(Alg alg, I first, S last, I pivot,
         return rp.base();
     } else {
         auto pivot_key = std::invoke(proj, *pivot);
-        return alg(first, last, [&](const auto& x) {
-            return !static_cast<bool>(
-                std::invoke(comp, std::invoke(proj, x), pivot_key));
-        });
+        return alg(first, last, pivot_key, detail::negate_comp(comp), proj);
     }
 }
 

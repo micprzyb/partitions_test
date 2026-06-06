@@ -45,10 +45,19 @@ constexpr std::size_t kAllSizes[] = {4,      8,       16,      24,
 // Target number of elements touched per timed iteration (sets the batch).
 constexpr std::size_t kElemsPerIter = 1u << 16;
 
-template <class T, class Dist, class Alg>
-void run_one(Dist dist, Alg alg, std::size_t n) {
+// Projection selecting only the first key of a pair (compare .first, carry the
+// whole element) -- the common (key, payload) use case.
+struct first_key {
+    template <class P>
+    auto operator()(const P& p) const {
+        return p.first;
+    }
+};
+
+template <class T, class Proj, class Gen, class Alg>
+void run_one(const char* tname, Proj proj, const char* dname, Gen gen, Alg alg,
+             std::size_t n) {
     auto comp = std::less<>{};
-    auto proj = projection_for<T>();
 
     const std::size_t batch = n < kElemsPerIter ? kElemsPerIter / n : 1;
     const std::size_t total = n * batch;
@@ -58,7 +67,7 @@ void run_one(Dist dist, Alg alg, std::size_t n) {
     master.reserve(total);
     std::vector<std::size_t> pivot_idx(batch);
     for (std::size_t b = 0; b < batch; ++b) {
-        auto block = dist.template operator()<T>(n, 0x1234u + b + n);
+        auto block = gen(n, 0x1234u + b + n);
         auto it = pivot::median_of_3{}(block.begin(), block.end(), comp, proj);
         pivot_idx[b] = static_cast<std::size_t>(it - block.begin());
         master.insert(master.end(), block.begin(), block.end());
@@ -85,18 +94,35 @@ void run_one(Dist dist, Alg alg, std::size_t n) {
 
     auto res = bench::measure(reps, setup, do_work);
     const double ns_per_elem = res.median_ns / static_cast<double>(total);
-    std::printf("%s,%s,%s,%zu,%zu,%llu,%.1f,%.1f,%.4f\n", type_name<T>(),
-                dist.name, alg.name, n, batch, (unsigned long long)res.reps,
+    std::printf("%s,%s,%s,%zu,%zu,%llu,%.1f,%.1f,%.4f\n", tname,
+                dname, alg.name, n, batch, (unsigned long long)res.reps,
                 res.median_ns, res.min_ns, ns_per_elem);
     std::fflush(stdout);
 }
 
-template <class T>
-void run_type(std::size_t max_size) {
+// `wrap_first`: for the pair64f case, the .first key must carry full entropy.
+// random_uniform packs rank>>8 into pair64::first, so a plain pair64 block has
+// all-equal first keys for n<256 (a degenerate all-equal partition).  When set,
+// blocks are generated as i64 ranks wrapped into pair64{rank, 0}.
+template <class T, class Proj>
+void run_type(const char* tname, Proj proj, std::size_t max_size,
+              bool wrap_first = false) {
     for_each(bench_distributions(), [&](auto d) {
+        auto gen = [&](std::size_t nn, std::uint64_t seed) -> std::vector<T> {
+            if constexpr (std::is_same_v<T, pair64>) {
+                if (wrap_first) {
+                    auto k = d.template operator()<i64>(nn, seed);
+                    std::vector<pair64> v(nn);
+                    for (std::size_t i = 0; i < nn; ++i) v[i] = pair64{k[i], 0};
+                    return v;
+                }
+            }
+            return d.template operator()<T>(nn, seed);
+        };
         for (std::size_t n : kAllSizes) {
             if (n > max_size) continue;
-            for_each(default_partitioners(), [&](auto alg) { run_one<T>(d, alg, n); });
+            for_each(default_partitioners(),
+                     [&](auto alg) { run_one<T>(tname, proj, d.name, gen, alg, n); });
         }
     });
 }
@@ -113,8 +139,8 @@ int main(int argc, char** argv) {
     }
 
     std::printf("type,distribution,algorithm,n,batch,reps,median_ns_total,min_ns_total,ns_per_elem\n");
-    run_type<i32>(max_size);
-    run_type<i64>(max_size);
-    run_type<pair64>(max_size);
+    run_type<i64>("i64", std::identity{}, max_size);
+    run_type<pair64>("pair64", std::identity{}, max_size);            // lexicographic
+    run_type<pair64>("pair64f", first_key{}, max_size, /*wrap_first=*/true);  // .first only
     return 0;
 }

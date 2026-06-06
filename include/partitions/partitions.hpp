@@ -28,13 +28,14 @@ constexpr void for_each(Tuple&& t, F&& f) {
     std::apply([&](auto&&... xs) { (f(xs), ...); }, std::forward<Tuple>(t));
 }
 
-// The partition algorithms under test.  All model PredicatePartitioner;
-// hoare_guarded additionally offers a position-aware fast path (`.at`) that
-// uses the pivot element as a sentinel.
+// The partition algorithms under test.  All model PivotPartitioner;
+// hoare_guarded and boost_block additionally offer a position-aware fast path
+// (`.at`) that uses the pivot element as a sentinel.
 inline auto default_partitioners() {
-    return std::tuple{algo::std_partition{}, algo::lomuto{},
+    return std::tuple{algo::std_partition{},   algo::lomuto{},
                       algo::lomuto_branchless{}, algo::hoare{},
-                      algo::hoare_guarded{}, algo::block{}};
+                      algo::hoare_guarded{},    algo::block{},
+                      algo::boost_block{},      algo::fulcrum{}};
 }
 
 // Pivot-selection strategies.  Most return a POSITION; midpoint_* return a

@@ -29,16 +29,21 @@ The library is header-only under `include/partitions/`. Everything composes thro
 
 Tests, benchmarks, and the balance report all iterate these tuples via `partitions::for_each`. **Adding an entry to a registry automatically enrolls it in every suite** — no other wiring is needed. This is the central design choice; preserve it when extending.
 
-### The single extension point: PredicatePartitioner
+### The single extension point: PivotPartitioner
 
-A partition algorithm implements **one** primitive (`concepts.hpp`):
+A partition algorithm implements **one** primitive (`concepts.hpp`), threading the comparator and projection directly (like the small sorters in `small_sort.hpp`):
 
 ```cpp
-template <std::random_access_iterator I, std::sentinel_for<I> S, class Pred>
-I operator()(I first, S last, Pred keep_left) const;
+template <std::random_access_iterator I, std::sentinel_for<I> S,
+          class K, class Comp, class Proj>
+I operator()(I first, S last, K pivot, Comp comp, Proj proj) const;
 ```
 
-From that, `partition_api.hpp` derives all four user-facing forms (forward/reverse × by-key/by-position) by varying only the predicate. Don't add separate code paths for the four forms — they collapse to one predicate call.
+It puts elements with `comp(proj(x), pivot)` first and returns the boundary. A partition only ever evaluates `comp` against the single fixed `pivot`, so `comp` acts as a unary predicate `below(x) = comp(proj(x), pivot)` — strict-weak ordering is irrelevant for the partition step itself.
+
+The pivot is passed **by value**, not `const K&` or `K&&`: a partition permutes the block while comparing against the pivot, so a *reference* pivot makes the compiler assume aliasing and reload it from memory every comparison; by value it stays in a register (verified by disassembly — both `const K&` and `K&&` reload, by value does not). Keys here are small (≤16 bytes), so the copy is free.
+
+From that, `partition_api.hpp` derives all four user-facing forms (forward/reverse × by-key/by-position) by varying only the comparator: forward passes `comp`, reverse passes the negated `ge(a,b) = !comp(a,b)` (which flips which side each element lands on). Don't add separate code paths for the four forms — they collapse to one call.
 
 ### Position-aware fast path (`at`)
 
