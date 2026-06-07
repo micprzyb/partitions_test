@@ -61,19 +61,19 @@ constexpr std::size_t kEPI = 1u << 16;
 // impossible numbers (i64 jumping 0.8 -> 1.7 between n=8 and n=10) -- a
 // measurement artifact.  The direct loop matches an isolated standalone micro.
 template <std::size_t N, class T, class Proj>
-[[gnu::noinline]] void apply_halve(T* a, std::size_t batch, Proj proj) {
+[[gnu::noinline, gnu::optimize("no-tree-vectorize")]] void apply_halve(T* a, std::size_t batch, Proj proj) {
     for (std::size_t b = 0; b < batch; ++b)
         small_halve::halve_n<N>(a + b * N, std::less<>{}, proj);
     asm volatile("" : : : "memory");
 }
 template <std::size_t N, class T, class Proj>
-[[gnu::noinline]] void apply_halve_reg(T* a, std::size_t batch, Proj proj) {
+[[gnu::noinline, gnu::optimize("no-tree-vectorize")]] void apply_halve_reg(T* a, std::size_t batch, Proj proj) {
     for (std::size_t b = 0; b < batch; ++b)
         small_halve::halve_reg<N>(a + b * N, std::less<>{}, proj);
     asm volatile("" : : : "memory");
 }
 template <std::size_t N, class T, class Proj>
-[[gnu::noinline]] void apply_sort(T* a, std::size_t batch, Proj proj) {
+[[gnu::noinline, gnu::optimize("no-tree-vectorize")]] void apply_sort(T* a, std::size_t batch, Proj proj) {
     for (std::size_t b = 0; b < batch; ++b)
         small_sort::sort_n<N>(a + b * N, std::less<>{}, proj);
     asm volatile("" : : : "memory");

@@ -9,3 +9,7 @@ partitions_enable_native(verify_small_sort)
 add_executable(verify_small_halve verify_small_halve.cpp)
 target_link_libraries(verify_small_halve PRIVATE partitions::partitions)
 partitions_enable_native(verify_small_halve)
+
+add_executable(verify_small_halve_rev verify_small_halve_rev.cpp)
+target_link_libraries(verify_small_halve_rev PRIVATE partitions::partitions)
+partitions_enable_native(verify_small_halve_rev)

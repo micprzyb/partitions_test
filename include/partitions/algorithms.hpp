@@ -676,6 +676,46 @@ struct fulcrum {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Size-dispatching partitioner.  Routes to the sub-partitioner that wins at the
+// given block size: a cheap branchless Lomuto for small blocks, the pdqsort
+// branchless block partition for large ones.  The branchless Lomuto does two
+// moves per element, so it only pays for narrow, cheap-to-move elements -- hence
+// the array-size threshold is itself chosen by sizeof(T) (the same rationale as
+// Rust ipnsort's size_of<T> rule): a generous cutoff for register-width keys,
+// almost none for wide (>8 byte) ones, which go straight to the block partition.
+// boost_block already has its own small-n scalar fallback, so this only adds the
+// Lomuto fast path where it actually wins.
+// ---------------------------------------------------------------------------
+namespace detail {
+template <class T>
+inline constexpr std::ptrdiff_t sized_cutoff = sizeof(T) <= 8 ? 512 : 24;
+}
+
+struct sized {
+    static constexpr const char* name = "sized";
+
+    template <std::random_access_iterator I, std::sentinel_for<I> S, class K,
+              class Comp, class Proj>
+    I operator()(I first, S last, K pivot, Comp comp, Proj proj) const {
+        I end = first + (last - first);
+        if (end - first <= detail::sized_cutoff<std::iter_value_t<I>>)
+            return lomuto_branchless{}(first, end, pivot, comp, proj);
+        return boost_block{}(first, end, pivot, comp, proj);
+    }
+
+    template <std::random_access_iterator I, std::sentinel_for<I> S,
+              class Comp = std::less<>, class Proj = std::identity>
+    I at(I first, S last_s, I pivot, Comp comp = {}, Proj proj = {}) const {
+        I last = first + (last_s - first);
+        if (last - first <= detail::sized_cutoff<std::iter_value_t<I>>) {
+            auto key = std::invoke(proj, *pivot);  // stable copy (no sentinel path)
+            return lomuto_branchless{}(first, last, key, comp, proj);
+        }
+        return boost_block{}.at(first, last, pivot, comp, proj);
+    }
+};
+
 }  // namespace partitions::algo
 
 #endif  // PARTITIONS_ALGORITHMS_HPP

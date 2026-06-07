@@ -35,7 +35,8 @@ inline auto default_partitioners() {
     return std::tuple{algo::std_partition{},   algo::lomuto{},
                       algo::lomuto_branchless{}, algo::hoare{},
                       algo::hoare_guarded{},    algo::block{},
-                      algo::boost_block{},      algo::fulcrum{}};
+                      algo::boost_block{},      algo::fulcrum{},
+                      algo::sized{}};
 }
 
 // Pivot-selection strategies.  Most return a POSITION; midpoint_* return a

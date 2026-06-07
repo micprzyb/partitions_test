@@ -4,6 +4,9 @@
 
 set(PARTITIONS_TEST_FILES
     test_partition_correctness.cpp
+    test_quicksort.cpp
+    test_reverse_partition.cpp
+    test_quicksort_rev.cpp
     test_pivot.cpp
     test_pivot_partition.cpp
     test_distributions.cpp

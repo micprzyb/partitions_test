@@ -1,0 +1,24 @@
+[INFO] Targeting System Binary: CaDiCaL 3.0.0
+[INFO] n=8, d=4, k=4 (LO), m=4 (HI), #0-1-inputs=70
+[INFO] Searching s ∈ [4, 16] ...
+[INFO] Hard clauses generated: 53,032 (Ready for export)
+[SEARCH] Trying s = 4 ... UNSAT
+[SEARCH] Trying s = 5 ... UNSAT
+[SEARCH] Trying s = 6 ... UNSAT
+[SEARCH] Trying s = 7 ... UNSAT
+[SEARCH] Trying s = 8 ... UNSAT
+[SEARCH] Trying s = 9 ... UNSAT
+[SEARCH] Trying s = 10 ... UNSAT
+[SEARCH] Trying s = 11 ... UNSAT
+[SEARCH] Trying s = 12 ... UNSAT
+[SEARCH] Trying s = 13 ... UNSAT
+[SEARCH] Trying s = 14 ... SAT -> optimal!
+
+======================================================================
+OPTIMAL PERFECT HALVER FOUND (Powered by CaDiCaL 3.0.0)
+n=8, depth=4, minimal #comparators = 14
+======================================================================
+Layer 0: [(0, 1), (2, 3), (4, 5), (6, 7)]
+Layer 1: [(0, 6), (1, 7), (2, 4), (3, 5)]
+Layer 2: [(1, 4), (2, 7), (3, 6)]
+Layer 3: [(0, 5), (1, 6), (3, 4)]

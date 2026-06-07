@@ -43,7 +43,16 @@ inline constexpr std::array<P, 4> h4 = {{{1,3},{0,1},{2,3},{1,2}}};
 inline constexpr std::array<P, 6> h5 = {{{0,3},{0,2},{1,3},{0,1},{2,4},{1,2}}};
 inline constexpr std::array<P, 8> h6 = {{{0,5},{1,3},{2,4},{1,2},{3,4},{0,3},{2,5},{2,3}}};
 inline constexpr std::array<P, 12> h7 = {{{0,4},{1,5},{2,6},{0,2},{1,3},{4,6},{2,4},{3,5},{0,1},{2,3},{4,5},{1,4}}};
+// 11-comparator halver for n=7 at split@3 (3 smallest in [0,3)), matching the
+// boundary halve_n<7> returns (first+3).  Obtained by reflecting the wires of the
+// split@4 11-comparator net (i -> 6-i): reflection maps split@k <-> split@(n-k),
+// and 7-4 = 3.  One fewer comparator than h7 (12); verified by 0/1 enumeration.
+inline constexpr std::array<P, 11> h7_alt = {{{0, 6}, {2, 4}, {1, 3}, {3, 6}, {4, 5}, {2, 3}, {0, 1}, {0, 5}, {3, 4}, {1, 2}, {2, 3}}};
 inline constexpr std::array<P, 15> h8 = {{{0,2},{1,3},{5,7},{0,4},{1,5},{3,7},{0,1},{2,3},{4,5},{6,7},{2,4},{3,5},{1,4},{3,6},{3,4}}};
+// 14-comparator, depth-4 halver for n=8 (split@4); one fewer comparator and two
+// shallower than h8.  Verified by 0/1 enumeration.  Faster than h8 in real
+// (scalar, one-block-per-call) use for all key types.
+inline constexpr std::array<P, 14> h8_new = {{{0,7},{1,4},{2,5},{3,6},{0,2},{1,3},{4,6},{5,7},{0,6},{1,7},{2,4},{3,5},{2,5},{3,4}}};
 inline constexpr std::array<P, 17> h9 = {{{2,5},{4,8},{0,7},{2,4},{3,8},{5,6},{0,2},{1,3},{4,5},{7,8},{1,4},{3,6},{5,7},{3,5},{2,3},{4,5},{3,4}}};
 inline constexpr std::array<P, 21> h10 = {{{0,8},{1,9},{2,7},{3,5},{4,6},{0,2},{1,4},{5,8},{7,9},{3,6},{2,4},{5,7},{0,1},{8,9},{1,5},{2,3},{4,8},{6,7},{3,5},{4,6},{4,5}}};
 inline constexpr std::array<P, 25> h11 = {{{0,9},{2,4},{3,7},{5,8},{0,1},{3,5},{4,10},{6,9},{7,8},{1,3},{2,5},{4,7},{8,10},{0,4},{1,2},{3,7},{5,9},{4,5},{7,8},{3,6},{2,4},{5,7},{3,4},{5,6},{4,5}}};
@@ -78,8 +87,8 @@ template <std::size_t N, class It, class Cmp = std::less<>, class Proj = std::id
     else if constexpr (N == 4) PARTITIONS_HALVE_APPLY(nets::h4);
     else if constexpr (N == 5) PARTITIONS_HALVE_APPLY(nets::h5);
     else if constexpr (N == 6) PARTITIONS_HALVE_APPLY(nets::h6);
-    else if constexpr (N == 7) PARTITIONS_HALVE_APPLY(nets::h7);
-    else if constexpr (N == 8) PARTITIONS_HALVE_APPLY(nets::h8);
+    else if constexpr (N == 7) PARTITIONS_HALVE_APPLY(nets::h7_alt);
+    else if constexpr (N == 8) PARTITIONS_HALVE_APPLY(nets::h8_new);
     else if constexpr (N == 9) PARTITIONS_HALVE_APPLY(nets::h9);
     else if constexpr (N == 10) PARTITIONS_HALVE_APPLY(nets::h10);
     else if constexpr (N == 11) PARTITIONS_HALVE_APPLY(nets::h11);
