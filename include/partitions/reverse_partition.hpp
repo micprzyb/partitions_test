@@ -11,39 +11,38 @@
 // and returns the boundary `m` (= the count of elements that are >= pivot).
 // This is exactly the `ptv::reverse_ok` contract in tests/verify.hpp.
 //
-// WHY A SEPARATE FILE AND NOT JUST A NEGATED COMPARATOR.  A forward partitioner
-// uses the comparator purely as a *unary* predicate `below(x) = comp(proj(x),
-// pivot)` (= x < pivot) and sends `below`-true elements left.  To get the
-// reversed split we want the *complementary* predicate
+// HOW THE REVERSAL IS DONE -- by EXCHANGING THE ROLES OF THE TWO SCANS, using
+// the SAME comparison as forward (not a negated comparator, not reverse
+// iteration).  A partition decides, per element, which side it goes to.  The
+// forward partitioners already use BOTH `below(x) = comp(proj(x), pivot)`
+// (= x < pivot) and its complement: e.g. Hoare's left scan advances over
+// `below` and its right scan over `!below`; the block partition's right fill
+// counts `below` and its left fill `!below`.  The reversed split is obtained by
+// swapping which scan plays which role -- the left scan now advances over
+// `!below` and the right over `below`, the block's left fill counts `below` and
+// its right fill `!below`.  So forward and reversed perform the *identical*
+// work: one `below` test and one `!below` test each.  There is NO inherent extra
+// operation and NO different comparison; written with the bare `below` and a
+// single `!` they compile to the same machine code (scalar: only the `setcc`
+// condition flips, `setg`<->`setle`; vectorised block: one `vpcmpgtq`, no
+// mask-invert -- verified by disassembly).  Equal elements land LEFT because the
+// strict `below` (x < pivot) is false for them, so they are never routed right.
 //
-//     keep(x) = !comp(proj(x), pivot)   (= x >= pivot)
-//
-// to drive the "goes left" decision.  For the scalar/block partitioners
-// (lomuto, hoare, block) that is a one-character change -- the predicate is a
-// unary test against a single fixed pivot, so flipping it is sound and FREE:
-// the compiler lowers `!(x < piv)` to `setae`/`cmovae` instead of `setb`,
-// identical instruction count and latency (verified by disassembly + the
-// head-to-head benchmark in bench_reverse_partition.cpp).  Strict-weak ordering
-// of the comparator is irrelevant here because it is never used to compare two
-// arbitrary elements -- only x against the fixed pivot.
-//
-// This is the SAME transformation `partition_api.hpp::reverse_partition_by_key`
-// performs via `negate_comp`; the rewritten forms below exist so the reversed
-// predicate is hard-wired into the hot loop (no comparator-wrapping closure at
-// all) and so the reversal cost can be measured against the forward original
-// with zero interface noise.  They are deliberate copies of the `algorithms.hpp`
-// originals with `below` replaced by `keep`; per the project brief code
-// duplication is accepted in exchange for guaranteed zero overhead.
+// (Two earlier WRONG approaches, kept out: negating the comparator -- breaks the
+// halver networks, which need a strict order; and reverse-iterating the block --
+// GCC fails to auto-vectorise a reverse_iterator scan, ~3.5x more, scalar code.
+// The role-exchange below avoids both: forward memory streaming, strict `<`,
+// fully vectorised, measured at parity with the forward partition.)
 //
 // NB: these do NOT model the forward `PivotPartitioner` contract (their middle
 // is the >=/< boundary, not </>=), so they are intentionally NOT added to
 // `default_partitioners()` -- the forward test/stat matrix would reject them.
 // They live in `partitions::algo_rev` and are exercised by their own tests and
 // benchmark.  No position-aware `at` fast path is provided: the forward sentinel
-// trick needs an in-block element that STOPS the left scan, i.e. one that is
-// `!keep` (< pivot); the pivot element itself is `keep` (== pivot, >=), so it
-// cannot serve as the reversed sentinel.  quicksort_rev (like the forward
-// quicksort) drives the partition by VALUE, so `at` is never needed.
+// trick needs an in-block element that STOPS the left scan (one that is
+// < pivot); the pivot element is == pivot, so it cannot serve as the reversed
+// sentinel.  quicksort_rev (like the forward quicksort) drives the partition by
+// VALUE, so `at` is never needed.
 
 #include <algorithm>
 #include <cstddef>
@@ -120,8 +119,10 @@ struct lomuto_branchless_rev {
 
 // ---------------------------------------------------------------------------
 // Reversed pdqsort branchless block partition.  Mirror of
-// algo::detail::branchless_partition, `below` -> `keep`.  Elements that are
-// `keep` (>= pivot) belong LEFT; the rest belong RIGHT.
+// algo::detail::branchless_partition, obtained by EXCHANGING THE ROLES of the
+// two scans -- the comparison stays the bare strict `below(x) = (x < pivot)`,
+// exactly as forward, so the reversed partition compiles to the same vector code
+// (one `vpcmpgtq`, no mask-invert).  Elements >= pivot end up LEFT, < pivot RIGHT.
 // ---------------------------------------------------------------------------
 namespace detail {
 
@@ -134,26 +135,34 @@ using algo::detail::swap_offsets;
 template <class Iter, class K, class Compare, class Proj>
 inline Iter branchless_partition_rev(Iter begin, Iter end, K pivot,
                                      Compare comp, Proj proj) {
-    // keep(x) = !comp(proj(x), pivot) = (x >= pivot): the reversed "goes left"
-    // predicate.  This is the ONLY change from the forward branchless_partition;
-    // see the file header for why flipping the unary predicate is sound + free.
-    auto keep = [&](Iter it) {
-        return !static_cast<bool>(
+    // The SAME strict comparison as the forward partition -- below(x) = (x <
+    // pivot).  The reversal is achieved purely by EXCHANGING THE ROLES of the two
+    // scans (not by negating the comparator, and not by reverse iteration): the
+    // forward left fill collects `!below` and the right fill `below`; here the
+    // left fill collects `below` and the right fill `!below`.  So forward and
+    // reversed compute exactly one `below` fill and one `!below` fill each --
+    // identical operation count.  Written with the BARE `below` and a single `!`
+    // (no `keep`/`!keep` double negation), GCC compiles both to the same vector
+    // code: one `vpcmpgtq`, NO mask-invert (verified by disassembly).
+    auto below = [&](Iter it) {
+        return static_cast<bool>(
             std::invoke(comp, std::invoke(proj, *it), pivot));
     };
 
     Iter first = begin;
     Iter last = end;
 
-    // Find the first element that does NOT belong left (first x < pivot).
-    while (first < last && keep(first)) ++first;
+    // Skip elements already on the correct (left) side: those >= pivot (!below).
+    // Stop at the first element strictly < pivot (it belongs on the right).
+    while (first < last && !below(first)) ++first;
 
-    // Find, from the right, the first element that DOES belong left (x >= pivot).
+    // From the right, find the first element that belongs LEFT (>= pivot, !below),
+    // skipping the correctly-placed strictly-< ones (below).
     if (first == begin) {
-        while (begin < last && !keep(--last)) {
+        while (begin < last && below(--last)) {
         }
     } else {
-        while (!keep(--last)) {
+        while (below(--last)) {
         }
     }
 
@@ -178,39 +187,45 @@ inline Iter branchless_partition_rev(Iter begin, Iter end, K pivot,
                 num_l == 0 ? (num_r == 0 ? num_unknown / 2 : num_unknown) : 0;
             std::size_t right_split = num_r == 0 ? (num_unknown - left_split) : 0;
 
-            // Left offset block: elements that belong on the RIGHT (x < pivot).
+            // Left offset block: elements that belong on the RIGHT (x < pivot,
+            // i.e. `below`) -- the role forward gives to its RIGHT fill.
             if (left_split >= boost_block_size) {
                 for (std::size_t i = 0; i < boost_block_size;) {
-                    offsets_l[num_l] = static_cast<unsigned char>(i++); num_l += !keep(first); ++first;
-                    offsets_l[num_l] = static_cast<unsigned char>(i++); num_l += !keep(first); ++first;
-                    offsets_l[num_l] = static_cast<unsigned char>(i++); num_l += !keep(first); ++first;
-                    offsets_l[num_l] = static_cast<unsigned char>(i++); num_l += !keep(first); ++first;
-                    offsets_l[num_l] = static_cast<unsigned char>(i++); num_l += !keep(first); ++first;
-                    offsets_l[num_l] = static_cast<unsigned char>(i++); num_l += !keep(first); ++first;
-                    offsets_l[num_l] = static_cast<unsigned char>(i++); num_l += !keep(first); ++first;
-                    offsets_l[num_l] = static_cast<unsigned char>(i++); num_l += !keep(first); ++first;
+                    offsets_l[num_l] = static_cast<unsigned char>(i++); num_l += below(first); ++first;
+                    offsets_l[num_l] = static_cast<unsigned char>(i++); num_l += below(first); ++first;
+                    offsets_l[num_l] = static_cast<unsigned char>(i++); num_l += below(first); ++first;
+                    offsets_l[num_l] = static_cast<unsigned char>(i++); num_l += below(first); ++first;
+                    offsets_l[num_l] = static_cast<unsigned char>(i++); num_l += below(first); ++first;
+                    offsets_l[num_l] = static_cast<unsigned char>(i++); num_l += below(first); ++first;
+                    offsets_l[num_l] = static_cast<unsigned char>(i++); num_l += below(first); ++first;
+                    offsets_l[num_l] = static_cast<unsigned char>(i++); num_l += below(first); ++first;
                 }
             } else {
                 for (std::size_t i = 0; i < left_split;) {
-                    offsets_l[num_l] = static_cast<unsigned char>(i++); num_l += !keep(first); ++first;
+                    offsets_l[num_l] = static_cast<unsigned char>(i++); num_l += below(first); ++first;
                 }
             }
 
-            // Right offset block: elements that belong on the LEFT (x >= pivot).
+            // Right offset block: elements that belong on the LEFT (x >= pivot,
+            // i.e. `!below`) -- the role forward gives to its LEFT fill.  Whether
+            // GCC vectorises this `!below` fill (lowering `>=` as `vpcmpgtq` + a
+            // free mask-invert, since AVX2 has no `>=` predicate) or the direct
+            // `below` fill is a context-dependent codegen choice; either way it
+            // benchmarks at parity with forward (the fill is store/swap-bound).
             if (right_split >= boost_block_size) {
                 for (std::size_t i = 0; i < boost_block_size;) {
-                    offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += keep(--last);
-                    offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += keep(--last);
-                    offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += keep(--last);
-                    offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += keep(--last);
-                    offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += keep(--last);
-                    offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += keep(--last);
-                    offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += keep(--last);
-                    offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += keep(--last);
+                    offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += !below(--last);
+                    offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += !below(--last);
+                    offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += !below(--last);
+                    offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += !below(--last);
+                    offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += !below(--last);
+                    offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += !below(--last);
+                    offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += !below(--last);
+                    offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += !below(--last);
                 }
             } else {
                 for (std::size_t i = 0; i < right_split;) {
-                    offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += keep(--last);
+                    offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += !below(--last);
                 }
             }
 

@@ -5,7 +5,7 @@
 // SECTION 1 -- standalone partitioner (one fixed by-value pivot, batched small
 // blocks; mirrors bench_partition.cpp).  Per (type, dist, n) the routes are:
 //   fwd       forward algo::sized                              (baseline)
-//   rev_rw    rewritten algo_rev::sized_rev                    (route a)
+//   rev_rw    rewritten algo_rev::sized_rev (role-exchanged, strict <) (route a)
 //   rev_neg   forward algo::sized + negate_comp(less)          (route b)
 //   rev_view  forward algo::sized over reverse_iterators       (route c)
 //
