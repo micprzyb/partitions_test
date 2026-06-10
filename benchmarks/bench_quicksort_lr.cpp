@@ -9,6 +9,10 @@
 //            small blocks under several minimum-finders (textbook reload vs
 //            register-key, branchy vs branchless, 1/2/4 accumulators, plus an
 //            OUT-OF-SPEC min+max double selection for reference).
+//   leaf   : selection leaf vs the halver leaf (quicksort's) vs insertion, with
+//            comparison + move COUNTS -- shows the selection leaf is latency-bound
+//            (serial min-reduction) vs the halver's throughput-bound parallel
+//            network: 2x slower on cheap-move i64, a tie on 16-byte pair64.
 //   ab     : pivot A/B -- inline branchless ninther_pos vs library pivot::ninther
 //            in ONE session (same driver) so frequency drift cancels in the ratio.
 //   part   : partitioner A/B in the threshold driver (sized vs Lomuto vs boost vs
@@ -30,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -280,6 +285,284 @@ void study_min(const char* tname, Proj proj, std::size_t max_size) {
         emit("bl2",          blocks([](auto f, auto l, auto c, auto p) { sel_sort<F_bl2>(f, l, c, p); }));
         emit("bl4",          blocks([](auto f, auto l, auto c, auto p) { sel_sort<F_bl4>(f, l, c, p); }));
         emit("minmax_oos",   blocks([](auto f, auto l, auto c, auto p) { sel_sort_minmax(f, l, c, p); }));
+    }
+}
+
+// ---- Part A2: LEAF head-to-head -- selection vs the halver leaf vs insertion,
+// on random blocks of the leaf sizes, with comparison + move counts.  This is
+// the direct test of "is the selection leaf actually cheaper than the halver
+// leaf?": per L-block, selection does L(L-1)/2 comparisons + <=L swaps; the
+// halver (detail::halve_sort) does Sum C(size) ~ L*logL compare-exchanges.
+
+long g_cmps = 0, g_moves = 0;
+struct count_cmp {
+    template <class A, class B>
+    bool operator()(const A& a, const B& b) const { ++g_cmps; return std::less<>{}(a, b); }
+};
+// A wrapper element that counts its own moves (copy/assign), so we see the move
+// traffic difference (selection's few swaps vs the halver's compare-exchanges).
+template <class T>
+struct counted {
+    T v{};
+    counted() = default;
+    counted(const counted& o) : v(o.v) { ++g_moves; }
+    counted(counted&& o) noexcept : v(o.v) { ++g_moves; }
+    counted& operator=(const counted& o) { v = o.v; ++g_moves; return *this; }
+    counted& operator=(counted&& o) noexcept { v = o.v; ++g_moves; return *this; }
+};
+
+// Tournament / tree-selection sort: find the min by a log-depth tournament over
+// element INDICES (not moving the data), then on each extraction recompute only
+// the root path -> O(L log L) comparisons.  Winner tree with a -1 "removed"
+// marker (no generic +inf needed).  Elements are emitted in order to a small
+// buffer, then copied back (2L element moves total -- far fewer than the halver).
+template <class It, class Comp, class Proj>
+void tournament_sort(It first, It last, Comp comp, Proj proj) {
+    using T = std::iter_value_t<It>;
+    using K = std::remove_cvref_t<decltype(std::invoke(proj, *first))>;
+    const int nn = static_cast<int>(last - first);
+    if (nn <= 1) return;
+    int P = 1;
+    while (P < nn) P <<= 1;
+    K key[64];
+    int tree[128];
+    T buf[64];
+    for (int i = 0; i < nn; ++i) key[i] = std::invoke(proj, first[i]);
+    for (int i = 0; i < P; ++i) tree[P + i] = (i < nn) ? i : -1;
+    auto match = [&](int a, int b) {
+        if (a < 0) return b;
+        if (b < 0) return a;
+        return static_cast<bool>(std::invoke(comp, key[b], key[a])) ? b : a;
+    };
+    for (int j = P - 1; j >= 1; --j) tree[j] = match(tree[2 * j], tree[2 * j + 1]);
+    for (int o = 0; o < nn; ++o) {
+        const int w = tree[1];          // current global min leaf
+        buf[o] = first[w];
+        int node = (P + w) >> 1;
+        tree[P + w] = -1;
+        for (; node >= 1; node >>= 1)
+            tree[node] = match(tree[2 * node], tree[2 * node + 1]);
+    }
+    for (int i = 0; i < nn; ++i) first[i] = buf[i];
+}
+
+// A large sentinel key for the supported types, so a "removed" leaf always loses
+// WITHOUT a branch (no generic +inf, so fall back to a copy of the build-time max
+// for unknown types -- only the three target types take the fast branchless path).
+template <class K>
+K key_inf() {
+    if constexpr (std::is_arithmetic_v<K>) return std::numeric_limits<K>::max();
+    else if constexpr (std::is_same_v<K, pair64>)
+        return pair64{std::numeric_limits<i64>::max(), std::numeric_limits<i64>::max()};
+    else return K{};
+}
+// Branchless tournament: removed leaves get a +inf key instead of a -1 index, so
+// `match` is a single comp + cmov with no misprediction.  Isolates how much of the
+// tournament's cost was the removed-index branches vs the indirection/serial sift.
+template <class It, class Comp, class Proj>
+void tournament_bl(It first, It last, Comp comp, Proj proj) {
+    using T = std::iter_value_t<It>;
+    using K = std::remove_cvref_t<decltype(std::invoke(proj, *first))>;
+    const int nn = static_cast<int>(last - first);
+    if (nn <= 1) return;
+    int P = 1;
+    while (P < nn) P <<= 1;
+    K key[64];
+    int tree[128];
+    T buf[64];
+    const K inf = key_inf<K>();
+    for (int i = 0; i < nn; ++i) key[i] = std::invoke(proj, first[i]);
+    for (int i = nn; i < P; ++i) key[i] = inf;
+    for (int i = 0; i < P; ++i) tree[P + i] = i;
+    auto match = [&](int a, int b) {
+        return static_cast<bool>(std::invoke(comp, key[b], key[a])) ? b : a;
+    };
+    for (int j = P - 1; j >= 1; --j) tree[j] = match(tree[2 * j], tree[2 * j + 1]);
+    for (int o = 0; o < nn; ++o) {
+        const int w = tree[1];
+        buf[o] = first[w];
+        key[w] = inf;
+        int node = (P + w) >> 1;
+        for (; node >= 1; node >>= 1)
+            tree[node] = match(tree[2 * node], tree[2 * node + 1]);
+    }
+    for (int i = 0; i < nn; ++i) first[i] = buf[i];
+}
+
+// The "sweet spot" between a full tournament and a linear scan: a 2-LEVEL
+// grouped selection.  Partition into groups of `g`; keep each group's running
+// min (key+index).  Each extraction scans the G group-mins for the global min
+// (sequential, cmov), emits it, marks it +inf, and recomputes ONLY that group's
+// min (sequential).  ~L*(g + L/g) comparisons, minimised near g=sqrt(L), with
+// far less indirection than the tree (two contiguous scans, no sift path).
+template <int G_SIZE, class It, class Comp, class Proj>
+void grouped_sort(It first, It last, Comp comp, Proj proj) {
+    using T = std::iter_value_t<It>;
+    using K = std::remove_cvref_t<decltype(std::invoke(proj, *first))>;
+    const int nn = static_cast<int>(last - first);
+    if (nn <= 1) return;
+    const K inf = key_inf<K>();
+    K key[64];
+    T buf[64];
+    for (int i = 0; i < nn; ++i) key[i] = std::invoke(proj, first[i]);
+    constexpr int g = G_SIZE;
+    const int G = (nn + g - 1) / g;
+    K gmk[64];
+    int gmi[64];
+    auto group_min = [&](int grp) {
+        const int lo = grp * g, hi = std::min(lo + g, nn);
+        K bk = key[lo];
+        int bi = lo;
+        for (int j = lo + 1; j < hi; ++j) {
+            const bool l = static_cast<bool>(std::invoke(comp, key[j], bk));
+            detail::cond_assign(bk, key[j], l);
+            bi = l ? j : bi;
+        }
+        gmk[grp] = bk;
+        gmi[grp] = bi;
+    };
+    for (int grp = 0; grp < G; ++grp) group_min(grp);
+    for (int o = 0; o < nn; ++o) {
+        K bk = gmk[0];
+        int bg = 0;
+        for (int grp = 1; grp < G; ++grp) {
+            const bool l = static_cast<bool>(std::invoke(comp, gmk[grp], bk));
+            detail::cond_assign(bk, gmk[grp], l);
+            bg = l ? grp : bg;
+        }
+        const int w = gmi[bg];
+        buf[o] = first[w];
+        key[w] = inf;
+        group_min(bg);
+    }
+    for (int i = 0; i < nn; ++i) first[i] = buf[i];
+}
+
+// =====================================================================
+// MIN-FINDING NETWORKS (data-INDEPENDENT, like the halver -- the right answer).
+// min_index<N>: a fixed, branchless, log-depth BALANCED-TREE reduction over the
+// N register-resident keys, tracking the winner's index by cmov.  NO indexed
+// memory (every access is a compile-time offset), NO branches -> max ILP, and
+// depth log2(N) instead of the 2-accumulator scan's N/2.  selection_sort_n<L>
+// unrolls the whole leaf from these networks; one switch dispatches the runtime
+// leaf size.
+// =====================================================================
+namespace minnet {
+template <int Lo, int Hi, class It, class Comp, class Proj, class K>
+[[gnu::always_inline]] inline void rec(It first, Comp& comp, Proj& proj, K& bk, int& bi) {
+    if constexpr (Hi - Lo == 1) {
+        bk = std::invoke(proj, first[Lo]);
+        bi = Lo;
+    } else {
+        constexpr int Mid = (Lo + Hi) / 2;
+        K ka, kb;
+        int ia, ib;
+        rec<Lo, Mid>(first, comp, proj, ka, ia);
+        rec<Mid, Hi>(first, comp, proj, kb, ib);
+        const bool lt = static_cast<bool>(std::invoke(comp, kb, ka));  // kb < ka
+        bk = ka;
+        detail::cond_assign(bk, kb, lt);  // bk = lt ? kb : ka
+        bi = lt ? ib : ia;
+    }
+}
+template <int N, class It, class Comp, class Proj>
+[[gnu::always_inline]] inline int min_index(It first, Comp comp, Proj proj) {
+    using K = std::remove_cvref_t<decltype(std::invoke(proj, *first))>;
+    K bk;
+    int bi;
+    rec<0, N>(first, comp, proj, bk, bi);
+    return bi;
+}
+}  // namespace minnet
+
+template <int L, class It, class Comp, class Proj>
+[[gnu::always_inline]] inline void selection_sort_n(It first, Comp comp, Proj proj) {
+    [&]<int... I>(std::integer_sequence<int, I...>) {
+        (..., ([&] {
+            constexpr int rem = L - I;
+            if constexpr (rem > 1) {
+                const int m = minnet::min_index<rem>(first + I, comp, proj);
+                if (m != 0) std::iter_swap(first + I, first + I + m);
+            }
+        }()));
+    }(std::make_integer_sequence<int, L>{});
+}
+
+template <class It, class Comp, class Proj>
+[[gnu::noinline]] void selsort_net(It first, It last, Comp comp, Proj proj) {
+    switch (static_cast<int>(last - first)) {
+        case 0: case 1: return;
+#define QSLR_NET_CASE(k) case k: selection_sort_n<k>(first, comp, proj); return;
+        QSLR_NET_CASE(2)  QSLR_NET_CASE(3)  QSLR_NET_CASE(4)  QSLR_NET_CASE(5)
+        QSLR_NET_CASE(6)  QSLR_NET_CASE(7)  QSLR_NET_CASE(8)  QSLR_NET_CASE(9)
+        QSLR_NET_CASE(10) QSLR_NET_CASE(11) QSLR_NET_CASE(12) QSLR_NET_CASE(13)
+        QSLR_NET_CASE(14) QSLR_NET_CASE(15) QSLR_NET_CASE(16) QSLR_NET_CASE(17)
+        QSLR_NET_CASE(18) QSLR_NET_CASE(19) QSLR_NET_CASE(20) QSLR_NET_CASE(21)
+        QSLR_NET_CASE(22) QSLR_NET_CASE(23) QSLR_NET_CASE(24)
+#undef QSLR_NET_CASE
+        default: detail::selection_sort(first, last, comp, proj);
+    }
+}
+
+template <class T, class Proj>
+void study_leaf(const char* tname, Proj proj, std::size_t max_size) {
+    auto comp = std::less<>{};
+    const std::size_t total = 1u << 18;
+    if (total > max_size) return;
+    auto master = dist::random_uniform{}.template operator()<T>(total, 0x1EAF1u);
+
+    for (std::size_t L : {std::size_t(4), std::size_t(6), std::size_t(8),
+                          std::size_t(12), std::size_t(16), std::size_t(20),
+                          std::size_t(24)}) {
+        auto run_each = [&](const char* nm, auto timed_block, auto count_block) {
+            // op counts (counting comparator + counted<T> elements, one pass)
+            std::vector<counted<T>> cw(master.size());
+            for (std::size_t i = 0; i < master.size(); ++i) cw[i].v = master[i];
+            g_cmps = 0; g_moves = 0;
+            for (std::size_t s = 0; s + L <= cw.size(); s += L)
+                count_block(cw.begin() + s, cw.begin() + s + L);
+            // correctness gate: every block must be sorted by (less, proj).
+            for (std::size_t s = 0; s + L <= cw.size(); s += L)
+                for (std::size_t i = s + 1; i < s + L; ++i)
+                    if (std::less<>{}(std::invoke(proj, cw[i].v), std::invoke(proj, cw[i - 1].v))) {
+                        std::fprintf(stderr, "LEAF NOT SORTED %s L=%zu %s\n", tname, L, nm);
+                        std::abort();
+                    }
+            const std::size_t blocks = master.size() / L;
+            double cpb = double(g_cmps) / blocks, mpb = double(g_moves) / blocks;
+            // timing (plain comparator, real element)
+            double ns = time_blocks<T>(total, master, [&](std::vector<T>& w) {
+                for (std::size_t s = 0; s + L <= w.size(); s += L)
+                    timed_block(w.begin() + s, w.begin() + s + L);
+            });
+            std::printf("leaf,%s,%zu,%s,%.4f,cmp=%.1f,mov=%.1f\n", tname, L, nm, ns, cpb, mpb);
+            std::fflush(stdout);
+        };
+        // Projection that applies the real proj to the counted wrapper's value,
+        // so the counted run compares in the SAME order as the timed run.
+        auto cproj = [&proj](const counted<T>& c) { return std::invoke(proj, c.v); };
+        // selection (our leaf), the halver leaf (quicksort's), insertion (ref).
+        run_each("selection",
+            [&](auto f, auto l) { detail::selection_sort(f, l, comp, proj); },
+            [&](auto f, auto l) { detail::selection_sort(f, l, count_cmp{}, cproj); });
+        run_each("halver",
+            [&](auto f, auto l) { detail::halve_sort(f, l, comp, proj); },
+            [&](auto f, auto l) { detail::halve_sort(f, l, count_cmp{}, cproj); });
+        run_each("insertion",
+            [&](auto f, auto l) { small_sort::insertion_sort(f, l, comp, proj); },
+            [&](auto f, auto l) { small_sort::insertion_sort(f, l, count_cmp{}, cproj); });
+        run_each("tournament",
+            [&](auto f, auto l) { tournament_sort(f, l, comp, proj); },
+            [&](auto f, auto l) { tournament_sort(f, l, count_cmp{}, cproj); });
+        run_each("tourn_bl",
+            [&](auto f, auto l) { tournament_bl(f, l, comp, proj); },
+            [&](auto f, auto l) { tournament_bl(f, l, count_cmp{}, cproj); });
+        run_each("group4",
+            [&](auto f, auto l) { grouped_sort<4>(f, l, comp, proj); },
+            [&](auto f, auto l) { grouped_sort<4>(f, l, count_cmp{}, cproj); });
+        run_each("selnet",
+            [&](auto f, auto l) { selsort_net(f, l, comp, proj); },
+            [&](auto f, auto l) { selsort_net(f, l, count_cmp{}, cproj); });
     }
 }
 
@@ -595,6 +878,7 @@ void study_depth(const char* tname, Proj proj, std::size_t max_size) {
 template <class T, class Proj>
 void run_type(const char* tname, Proj proj, std::size_t max_size, const std::string& mode) {
     if (mode == "all" || mode == "min") study_min<T>(tname, proj, max_size);
+    if (mode == "all" || mode == "leaf") study_leaf<T>(tname, proj, max_size);
     if (mode == "all" || mode == "ab") study_ab<T>(tname, proj, max_size);
     if (mode == "all" || mode == "part") study_part<T>(tname, proj, max_size);
     if (mode == "all" || mode == "pivcut") study_pivcut<T>(tname, proj, max_size);

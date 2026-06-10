@@ -115,6 +115,113 @@ study and confirmed by disassembly:
 - **Cost of the constraint:** an out-of-spec double-ended min+max selection (one
   scan, both ends) is ~1.5–1.9× faster, bounding what find-min-only costs.
 
+## Why the selection leaf is the ceiling (latency vs throughput)
+
+The natural objection is: a selection sort of an `L`-block does only `L`
+min-searches + ≤`L` swaps, with *far fewer moves* than the halver leaf and "min
+is easier than median" — so it ought to be *much* faster, and `quicksort_lr`
+ought to beat `quicksort`. The `leaf` study (selection vs the halver leaf vs
+insertion on random blocks, with op counts) shows why it does not — and the
+answer is **instruction-level parallelism**, not the move/compare counts:
+
+| L=24 block | i64 ns | cmp | mov | pair64 ns | cmp | mov |
+|---|---|---|---|---|---|---|
+| halver (quicksort) | **3.5** | 202 | 606 | 10.4 | 202 | 606 |
+| selection (ours)   | 7.0 | 299 | **61** | **9.4** | 276 | **61** |
+| insertion          | 6.2 | 276 | 828 | 55.4 | 276 | 828 |
+
+Selection really does ~10× fewer moves (61 vs 606) and *fewer total operations*
+(360 vs 808) — yet on `i64` it is **2× slower**. The reason:
+
+- The halver is a **compare-exchange network**: its operations are
+  **data-independent**, so the out-of-order core issues 4–6/cycle
+  (throughput-bound). 808 parallel ops finish in 3.5 ns/elem.
+- Selection's min-search is a **serial reduction** — `min ← cmov(min, a[j])` is a
+  **loop-carried dependency** (each compare needs the previous running min), so it
+  runs at ~1 step per `cmp+cmov` latency (~2–3 cycles), **latency-bound**,
+  regardless of how few ops it is.
+
+So the outcome is **move-cost dependent**: on cheap-move `i64` the halver's
+parallelism wins decisively; on expensive-move 16-byte `pair64` selection's
+move savings make it a *tie* (it even wins at L=16/24). End-to-end `lr/qs ≈ 0.95`
+is exactly the i64 leaf losing the ILP race, partly offset by the pair64 leaf.
+
+This is **not an implementation problem**: the shipped `find_min` already uses 2
+accumulators to break the serial chain (without it selection is ~3× slower);
+more accumulators were measured (`min` study `bl4`) and lose to register/merge
+overhead. (The out-of-spec min+max double-selection — half the passes — is ~1.7×
+faster, which is the measured cost of constraint 1.)
+
+### Tournament / tree-selection: fewer operations, but *slower* (the `leaf` study)
+
+The deeper objection is that the min-search need not be a linear scan at all: a
+**tournament** finds the min in log-depth (parallel) and, with **reuse**, makes
+the whole selection **O(L log L)** comparisons (recompute only the root path),
+moving *indices* not elements. I implemented and measured three forms — a winner-
+tree tournament, a **branchless** tournament (`+inf` sentinel, no removed-leaf
+mispredict), and a 2-level **grouped** selection. The op-counts confirm the
+theory; the timings invert it (i64, L=24, median of 5):
+
+| method | ns/elem | comparisons |
+|---|---|---|
+| halver (data-*independent* network) | **3.6** | 202 |
+| selection (linear, 2-acc) | 6.5 | 299 |
+| grouped 2-level | 8.3 | 210 |
+| tournament, branchless | 16.1 | 151 |
+| tournament, full tree | 19.4 | **83** |
+
+The tournament does **3.6× fewer comparisons** yet runs **3× slower**. Cause:
+**fewer ops ≠ faster at small L** — the core is bound by dependency latency and
+access pattern, not op-count. Reuse needs a position-indexed structure, so the
+sift-up is a **serial chain of indexed `tree[]`/`key[]` loads** (the branchless
+variant proves it is the *structure*, not the branches); the linear scan instead
+streams the array **sequentially** with a short `cmov` chain, and the halver is
+**data-independent** (no dependency at all → maximal ILP).
+
+### Min-finding *networks* (`min_index<N>`): the register-pressure wall
+
+The natural fix is to make the min-finder a **data-independent network** like the
+halver: a fixed, branchless, **log-depth balanced-tree** reduction over the N
+register-resident keys, tracking the winner index by `cmov` (`selnet` in the
+`leaf` study). The disassembly is exactly what you'd hope **for scalar keys** —
+and exactly the problem **for the wide key**:
+
+| `min_index<N>` | insns | cmov | branches | stack-spill ops |
+|---|---|---|---|---|
+| n=24, i64 | 142 | 37 | 0 | **0** |
+| n=24, pair64-by-first | 142 | 37 | 0 | **0** |
+| n=24, pair64 lex | 570 | 122 | 62 | **95** |
+
+Yet the network is **slower than the 2-accumulator scan** (i64 L=24: 9.1 vs 6.1;
+pair64: 25.9 vs 9.7 ns/elem). Three measured reasons:
+
+1. **Register pressure.** A log-depth tree keeps `O(width)` live `(key,index)`
+   pairs; for 16-byte `pair64` that exceeds the GP registers → **95 spills** (+ 62
+   short-circuit branches from the lex compare). The 2-accumulator scan keeps
+   **two**. The `min` study already shows the trend: **4 accumulators lose to 2** —
+   going wider trades depth for pressure and the optimum is **2-wide**. The tree
+   is the wide extreme.
+2. **Front-end bloat (scalar).** `selection_sort_n<L>` unrolls L networks
+   (~1800 instructions at L=24); the core is decode-bound, while the 2-accumulator
+   loop runs from the µop cache.
+3. **The structural reason (decisive).** The halver leaf is **one** data-
+   independent network — independent sub-halvings, no data-dependent address or
+   control, fully pipelined. Selection sort is **L serial passes**: find-min →
+   **swap** → find-min of the next suffix, which *reads the just-swapped array*.
+   Each pass depends on the previous swap's store. A faster per-pass min-network
+   cannot remove the serialization *between* passes. So the halver wins
+   *structurally* (parallel network vs serial passes), and no selection-based
+   method — linear, tournament, or network — can match it, because "find the
+   minimum and swap, and proceed" is a serial chain of L passes by construction.
+
+The ranking, then: **data-independence + parallel structure > low register
+pressure > op-count**, with op-count last. The 2-accumulator linear scan is the
+optimal *selection* leaf precisely because it is the lowest-register-pressure
+2-wide network; the halver's edge is the parallel structure that constraint 1
+forbids. (All variants — tournament, branchless tournament, grouped, and the
+`min_index<N>` networks — are kept in the `leaf` study as documented negative
+results.)
+
 ## Threshold sweep
 
 Median of 3, n = 2²², ns/elem:
