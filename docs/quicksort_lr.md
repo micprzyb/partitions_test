@@ -67,15 +67,14 @@ ninther, same driver/threshold/stack/leaf so frequency drift cancels):
    ninther drops from **15→3** branches on `i64` (29 `cmov`), 12→3 on `pair64f`,
    64→26 on `pair64` (the residual = the well-predicted lex short-circuits).
 
-| ns/elem, n=2²², vs library ninther | i64 | pair64 lex | pair64f |
+| ns/elem, n=2²², vs library ninther (fair data) | i64 | pair64 lex | pair64f |
 |---|---|---|---|
-| inline branchless ninther | **+3.0%** | **+3.8%** | −4.0% |
+| inline branchless ninther | **+3.5%** | **+3.9%** | **+0.3%** |
 
-Summed over the three target types branchless nets **+2.8%**, the best of
-branchless / branchy / library — so it is the raw-throughput choice. (`pair64f`
-loses because the repo generator makes its `.first` low-cardinality and the
-cheap, well-predicted median compares prefer the early-out `if` to a longer
-`cmov` chain; on the two healthy types it is a clear win.)
+Faster or tied on **all three** target types — the best of branchless / branchy /
+library, so it is the raw-throughput choice. (An earlier run showed `pair64f`
+−4%, but that was the low-cardinality `.first` generator artifact; on fair
+high-cardinality keys it is neutral.)
 
 ### Median-of-3 size tier — measured and REJECTED
 
@@ -224,19 +223,36 @@ results.)
 
 ## Threshold sweep
 
-Median of 3, n = 2²², ns/elem:
+Median of 3, n = 2²², ns/elem (fair high-cardinality data):
 
 | type / dist | T8 | T12 | T16 | T20 | T24 | T32 | best |
 |---|---|---|---|---|---|---|---|
-| i64 random        | 20.4 | 19.8 | 19.6 | **19.4** | 19.8 | 20.3 | T20 |
-| pair64 random     | 48.6 | 47.3 | **46.6** | 46.6 | 47.0 | 48.3 | T16/20 |
-| pair64f random    | 64.0 | 63.5 | 62.4 | 61.7 | 61.3 | 61.3 | →larger (low-card) |
-| i64 sorted_asc    | **12.3** | 12.6 | 13.1 | 13.1 | 13.3 | 13.8 | T8 |
+| i64 random     | 17.8 | 16.8 | **16.5** | 16.5 | 16.7 | 17.2 | T16/20 |
+| pair64 random  | 42.1 | **40.4** | 40.6 | 40.6 | 40.9 | 42.2 | T12–20 |
+| pair64f random | 23.8 | 22.7 | **21.7** | 22.1 | 23.2 | 22.7 | T16 |
 
-A flat plateau T16–T24 on random; **`qslr_threshold = 20`** (i64 peak, pair64
-tied). Selection sort being non-adaptive, sorted input prefers a smaller leaf;
-20 keeps that penalty bounded. `pair64f` drifts toward larger thresholds only
-because of the low-cardinality `.first` generator.
+A flat plateau **T12–T20** on random for all three types — including `pair64f`,
+which on fair high-cardinality data behaves like the others (the earlier "drifts
+to larger thresholds" was the low-cardinality artifact). **`qslr_threshold = 20`**
+sits in the plateau (within ~1% of each type's optimum). Selection sort being
+non-adaptive, already-sorted input prefers a smaller leaf; 20 keeps that bounded.
+
+## Benchmark fairness: the cardinality trap
+
+The first cut of this head-to-head produced nonsense — `std::sort` *faster* on
+`pair64f` than on `i64`, and both repo quicksorts *slower* on `pair64f` than on
+`pair64` lex. Cause: a **data-generation artifact**, not the algorithms.
+`dist::random_uniform` draws ranks in `[0,n]` and `make_value<pair64>(rank) =
+{rank>>8, rank&0xff}`, so the `i64` key and the `pair64` *lexicographic* key are
+both `rank` (**63% distinct**), but the `pair64`-**by-first** key `.first =
+rank>>8` is only **0.4% distinct** — a hidden low-cardinality test. Comparing a
+low-cardinality sort against high-cardinality ones is apples-to-oranges (the
+no-3-way quicksorts degrade on the duplicates; `std::sort`/`pdqsort` *speed up*
+on fewer distinct values). The benchmark now routes all generation through
+`gen_data`, which puts the **full rank** in `.first` for the by-first case so
+every type sorts a key of the **same** cardinality, isolating the real
+difference (16-byte vs 8-byte element, identical `i64` compare). The numbers
+below are the corrected, fair ones.
 
 ## Head-to-head
 
@@ -246,25 +262,27 @@ Median of 3, ns/elem, at the tuned default T20, vs the recursive halver-leaf
 
 | type / dist | quicksort_lr | quicksort | pdqsort | std::sort | lr/qs | lr/pdq |
 |---|---|---|---|---|---|---|
-| i64 random        | 19.2 | 18.3 | 23.5 | 61.7 | 0.95 | **1.23** |
-| i64 sorted_asc    | 12.0 |  9.4 | 0.52 |  6.7 | 0.78 | 0.04 |
-| pair64 random     | 47.7 | 44.8 | 83.9 | 88.5 | 0.94 | **1.76** |
-| pair64 sorted_asc | 15.6 | 18.5 | 1.88 | 16.6 | **1.18** | 0.12 |
-| pair64f random    | 62.7 | 60.9 | 43.5 | 50.2 | 0.97 | 0.69 |
-| pair64f sorted_asc| 56.9 | 53.8 | 1.56 |  8.5 | 0.95 | 0.03 |
+| i64 random        | 16.5 | 15.6 | 20.2 | 53.5 | 0.94 | **1.23** |
+| i64 sorted_asc    |  9.7 |  7.8 | 0.39 |  5.6 | 0.80 | 0.04 |
+| pair64 random     | 40.1 | 38.0 | 73.0 | 77.0 | 0.95 | **1.82** |
+| pair64 sorted_asc | 12.9 | 15.0 | 1.37 | 12.8 | **1.16** | 0.11 |
+| pair64f random    | 21.5 | 22.0 | 53.5 | 57.2 | **1.03** | **2.49** |
+| pair64f sorted_asc|  9.8 |  9.6 | 1.13 |  6.6 | 0.97 | 0.11 |
 
-**Reading it.** The rewrite lifted `lr/qs` on the healthy random cases from
-~0.91–0.93 (the first version) to **0.94–0.97** — i.e. within ~5% of the
-unconstrained recursive `quicksort`, the remaining gap being the selection leaf
-vs its halver leaf (the halver does a balanced split with ~20–33% fewer
-compare-exchanges, no index bookkeeping). It is still **1.23× faster than
-`boost::pdqsort` on `i64`** and **1.76× on `pair64` lexicographic** (both repo
-quicksorts use a branchless block partition where pdqsort goes branchy on the
-16-byte lex compare), and it even beats the recursive `quicksort` on sorted
-`pair64` (1.18×).
+Now the ordering is sensible — `i64 < pair64f < pair64` lex for **every** sorter
+(wider element, then expensive lex compare).
 
-It inherits the repo quicksort's two documented weaknesses, both orthogonal to
-the three constraints: no **3-way** equal partition (so the low-cardinality
-`pair64f` generator costs ~1.4× vs pdqsort) and no **pattern defeating** (so
-already-sorted input is ~20× pdqsort, which detects the run). Adding either would
-help all three constraints equally and is the obvious next step.
+**Reading it.** On random high-cardinality input `quicksort_lr` is **1.23–2.49×
+faster than `boost::pdqsort`** (both repo quicksorts use a branchless block
+partition; pdqsort goes branchy on the 16-byte lex compare), and is **competitive
+with the unconstrained recursive `quicksort`** — `lr/qs` 0.94–1.03, in fact
+**ahead on `pair64f` (1.03)** and on sorted `pair64` (1.16). The one place it
+trails `quicksort` is **cheap-move `i64`** (`lr/qs` 0.94 random, 0.80 sorted):
+that is exactly the selection-vs-halver leaf gap from the `leaf` study — on
+16-byte elements the selection leaf's far fewer moves cancel it, but on 8-byte
+`i64` the halver's parallel network wins. The remaining weakness is **pattern
+defeating** (no run detection → already-sorted input is ~20× pdqsort, which
+*does* detect it); and genuinely **low-cardinality** input (the `few_unique`
+distribution, not the now-fixed random `pair64f`) still degrades for want of a
+**3-way** partition. Both are orthogonal to the three constraints and are the
+obvious next steps.

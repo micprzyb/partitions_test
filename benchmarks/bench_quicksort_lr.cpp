@@ -59,6 +59,31 @@ struct first_key {
     }
 };
 
+// Generate `n` elements of type T for distribution `d`, FAIRLY across types.
+//
+// The trap (see the perf-methodology memo): dist::random_uniform draws ranks in
+// [0,n] and make_value<pair64>(rank) = {rank>>8, rank&0xff}.  So the i64 key and
+// the pair64 LEXICOGRAPHIC key are both `rank` (~63% distinct, high cardinality),
+// but the pair64-BY-FIRST key `.first = rank>>8` has only ~n/256 distinct values
+// (0.4% -- low cardinality).  Comparing a low-cardinality sort against high-
+// cardinality ones is apples-to-oranges and produces nonsensical cross-type
+// numbers (the no-3-way quicksorts degrade on the dups; std::sort/pdqsort speed
+// up on fewer distinct values).  Fix: for the by-first case put the FULL rank in
+// .first so its key has the SAME cardinality as the i64 key, isolating the real
+// difference (16-byte vs 8-byte element, identical i64 compare).
+template <class T, class Dist, class Proj>
+std::vector<T> gen_data(Dist d, std::size_t n, std::uint64_t seed, Proj) {
+    if constexpr (std::is_same_v<T, pair64> &&
+                  !std::is_same_v<std::decay_t<Proj>, std::identity>) {
+        const auto ranks = d.template operator()<i64>(n, seed);
+        std::vector<pair64> out(n);
+        for (std::size_t i = 0; i < n; ++i) out[i] = pair64{ranks[i], 0};
+        return out;
+    } else {
+        return d.template operator()<T>(n, seed);
+    }
+}
+
 // ===========================================================================
 // Minimum-finders under study.  Each is a stateless functor:
 //     It operator()(It first, It last, Comp comp, Proj proj) const;  // last>first
@@ -255,7 +280,7 @@ void study_min(const char* tname, Proj proj, std::size_t max_size) {
     auto comp = std::less<>{};
     const std::size_t total = 1u << 18;
     if (total > max_size) return;
-    auto master = dist::random_uniform{}.template operator()<T>(total, 0x51A7Eu);
+    auto master = gen_data<T>(dist::random_uniform{}, total, 0x51A7Eu, proj);
 
     for (std::size_t L : {std::size_t(4), std::size_t(8), std::size_t(12),
                           std::size_t(16), std::size_t(20), std::size_t(24),
@@ -509,7 +534,7 @@ void study_leaf(const char* tname, Proj proj, std::size_t max_size) {
     auto comp = std::less<>{};
     const std::size_t total = 1u << 18;
     if (total > max_size) return;
-    auto master = dist::random_uniform{}.template operator()<T>(total, 0x1EAF1u);
+    auto master = gen_data<T>(dist::random_uniform{}, total, 0x1EAF1u, proj);
 
     for (std::size_t L : {std::size_t(4), std::size_t(6), std::size_t(8),
                           std::size_t(12), std::size_t(16), std::size_t(20),
@@ -620,9 +645,9 @@ void study_thresh(const char* tname, Proj proj, std::size_t max_size) {
     // so a larger leaf costs more on already-ordered data).  few_unique is
     // omitted from the sweep: it is dominated by the no-3-way partition
     // recursion and is essentially threshold-independent (just slow).
-    sweep("random_uniform", dist::random_uniform{}.template operator()<T>(n, 0x9501Du + n));
-    sweep("sorted_ascending", dist::sorted_ascending{}.template operator()<T>(n, 0));
-    sweep("sorted_descending", dist::sorted_descending{}.template operator()<T>(n, 0));
+    sweep("random_uniform", gen_data<T>(dist::random_uniform{}, n, 0x9501Du + n, proj));
+    sweep("sorted_ascending", gen_data<T>(dist::sorted_ascending{}, n, 0, proj));
+    sweep("sorted_descending", gen_data<T>(dist::sorted_descending{}, n, 0, proj));
 }
 
 // ---- Part B2: pivot-tier cutoff sweep (median-of-3 small / ninther large) ---
@@ -659,14 +684,14 @@ void study_pivcut(const char* tname, Proj proj, std::size_t max_size) {
         // The sweep over the safe band 16..128 already shows the median-of-3 tier
         // is a wash on random and a growing penalty on sorted.
     };
-    sweep("random_uniform", dist::random_uniform{}.template operator()<T>(n, 0x9501Du + n));
-    sweep("sorted_ascending", dist::sorted_ascending{}.template operator()<T>(n, 0));
-    sweep("sorted_descending", dist::sorted_descending{}.template operator()<T>(n, 0));
+    sweep("random_uniform", gen_data<T>(dist::random_uniform{}, n, 0x9501Du + n, proj));
+    sweep("sorted_ascending", gen_data<T>(dist::sorted_ascending{}, n, 0, proj));
+    sweep("sorted_descending", gen_data<T>(dist::sorted_descending{}, n, 0, proj));
     // Safety probe: median_of_3_killer at a SMALL n -- an over-large cutoff goes
     // O(n^2) here (ns/elem in the hundreds-thousands) while a safe cutoff stays
     // O(n log n) (tens).  n kept small so even the O(n^2) cells finish fast.
     std::size_t nk = std::min<std::size_t>(1u << 13, max_size);
-    sweep("m3_killer_small", dist::median_of_3_killer{}.template operator()<T>(nk, 0));
+    sweep("m3_killer_small", gen_data<T>(dist::median_of_3_killer{}, nk, 0, proj));
 }
 
 // ---- Part B3: pivot A/B -- isolate "inline ninther_pos vs library pivot::ninther"
@@ -708,7 +733,7 @@ template <class T, class Proj>
 void study_ab(const char* tname, Proj proj, std::size_t max_size) {
     auto comp = std::less<>{};
     std::size_t n = std::min<std::size_t>(1u << 22, max_size);
-    auto m = dist::random_uniform{}.template operator()<T>(n, 0x9501Du + n);
+    auto m = gen_data<T>(dist::random_uniform{}, n, 0x9501Du + n, proj);
     time_full("ab", tname, "random_uniform", n, "ninther_inline", proj, m,
               [&](std::vector<T>& w) { ab_drv<20>(w.begin(), w.end(), piv_inline{}, comp, proj); });
     time_full("ab", tname, "random_uniform", n, "ninther_lib", proj, m,
@@ -754,7 +779,7 @@ template <class T, class Proj>
 void study_part(const char* tname, Proj proj, std::size_t max_size) {
     auto comp = std::less<>{};
     std::size_t n = std::min<std::size_t>(1u << 22, max_size);
-    auto m = dist::random_uniform{}.template operator()<T>(n, 0x9501Du + n);
+    auto m = gen_data<T>(dist::random_uniform{}, n, 0x9501Du + n, proj);
     auto one = [&](const char* nm, auto part) {
         time_full("part", tname, "random_uniform", n, nm, proj, m,
                   [&](std::vector<T>& w) { part_drv<20>(w.begin(), w.end(), part, comp, proj); });
@@ -791,12 +816,12 @@ void study_vs(const char* tname, Proj proj, std::size_t max_size) {
     };
     for (std::size_t n : {std::size_t(1u << 16), std::size_t(1u << 20), std::size_t(1u << 22)}) {
         if (n > max_size) continue;
-        one("random_uniform", n, dist::random_uniform{}.template operator()<T>(n, 0x9501Du + n));
+        one("random_uniform", n, gen_data<T>(dist::random_uniform{}, n, 0x9501Du + n, proj));
     }
     std::size_t n = 1u << 20;
     if (n <= max_size) {
-        one("sorted_ascending", n, dist::sorted_ascending{}.template operator()<T>(n, 0));
-        one("sorted_descending", n, dist::sorted_descending{}.template operator()<T>(n, 0));
+        one("sorted_ascending", n, gen_data<T>(dist::sorted_ascending{}, n, 0, proj));
+        one("sorted_descending", n, gen_data<T>(dist::sorted_descending{}, n, 0, proj));
     }
 }
 
@@ -849,7 +874,7 @@ void study_depth(const char* tname, Proj proj, std::size_t max_size) {
     {
         std::size_t n = std::min<std::size_t>(4096, max_size);
         for_each(default_distributions(), [&](auto d) {
-            probe(d.name, d.template operator()<T>(n, 0x9501Du + n));
+            probe(d.name, gen_data<T>(d, n, 0x9501Du + n, proj));
         });
     }
     // (b) The non-pathological distributions at large n -- where log2(n), hence
@@ -858,15 +883,15 @@ void study_depth(const char* tname, Proj proj, std::size_t max_size) {
     // empty every step.)
     {
         std::size_t n = std::min<std::size_t>(1u << 22, max_size);
-        probe("random_uniform@big", dist::random_uniform{}.template operator()<T>(n, 1));
-        probe("sorted_ascending@big", dist::sorted_ascending{}.template operator()<T>(n, 0));
-        probe("sorted_descending@big", dist::sorted_descending{}.template operator()<T>(n, 0));
-        probe("nearly_sorted@big", dist::nearly_sorted{}.template operator()<T>(n, 2));
-        probe("organ_pipe@big", dist::organ_pipe{}.template operator()<T>(n, 0));
-        probe("reverse_organ_pipe@big", dist::reverse_organ_pipe{}.template operator()<T>(n, 0));
-        probe("shuffled_blocks@big", dist::shuffled_blocks{}.template operator()<T>(n, 3));
-        probe("median_of_3_killer@big", dist::median_of_3_killer{}.template operator()<T>(n, 0));
-        probe("single_outlier@big", dist::single_outlier{}.template operator()<T>(n, 0));
+        probe("random_uniform@big", gen_data<T>(dist::random_uniform{}, n, 1, proj));
+        probe("sorted_ascending@big", gen_data<T>(dist::sorted_ascending{}, n, 0, proj));
+        probe("sorted_descending@big", gen_data<T>(dist::sorted_descending{}, n, 0, proj));
+        probe("nearly_sorted@big", gen_data<T>(dist::nearly_sorted{}, n, 2, proj));
+        probe("organ_pipe@big", gen_data<T>(dist::organ_pipe{}, n, 0, proj));
+        probe("reverse_organ_pipe@big", gen_data<T>(dist::reverse_organ_pipe{}, n, 0, proj));
+        probe("shuffled_blocks@big", gen_data<T>(dist::shuffled_blocks{}, n, 3, proj));
+        probe("median_of_3_killer@big", gen_data<T>(dist::median_of_3_killer{}, n, 0, proj));
+        probe("single_outlier@big", gen_data<T>(dist::single_outlier{}, n, 0, proj));
     }
     std::printf("depth,%s,__WORST__,%zu,cap%d,%d\n", tname, std::size_t(1u << 22),
                 detail::qslr_stack_cap, worst);
