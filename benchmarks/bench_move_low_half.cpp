@@ -40,11 +40,19 @@
 //                    quickselect the tail in place.  (shipped move_low_half_exact)
 //   rev_count_select : count S (move-free scan), reverse-quickselect the whole
 //                    array; the high-p alternative to key_select.
+//   rev_part_until : part_until on the reversed partition -- the descent keeps
+//                    all below-key elements in the [lo, end) suffix and the
+//                    accepted tail is the answer in place (no move).  Same
+//                    biased k (conditioned 9-sample pivot), pure raw speed.
 //
 // We verify each output (bottom-k property + multiset) and report k/S (how close
 // to 0.5) alongside ns/elem.  The crucial axis is the KEY PERCENTILE p (= S/n).
 //
-// CSV: type,dist,p,n,algo,ns_per_elem,k_over_S
+// CSV: type,dist,p,n,algo,ns_per_elem,k_over_S,ns_per_k,ns_per_min
+//   ns_per_k   = total ns / k            (cost per DELIVERED element)
+//   ns_per_min = total ns / min(k, S-k)  (cost per USEFUL element: a biased cut
+//                shrinks the smaller side of the below-key split and with it
+//                the split's value -- the docs/partition_efficiency.md metric)
 
 #include <algorithm>
 #include <cstdint>
@@ -248,6 +256,36 @@ std::ptrdiff_t v_rev_count_select(It a, It end, K key, Comp comp, Proj proj) {
     return k;
 }
 
+// ---- rev_part_until: part_until rebuilt on the reversed partition -- the
+// mirror descent.  Invariant: every below-key element of the WHOLE array is in
+// [lo, end) (the discarded heads were all >= some pivot >= key).  One reversed
+// ninther-partition per pass: [lo, m) >= val | [m, end) < val, pivot parked at
+// m-1.  If val < key, the suffix [m-1, end) (pivot included -- it is < key and
+// everything left of it is >= val) is a valid bottom-k ALREADY AT THE END --
+// return, no move.  Else descend into the tail (lo = m).  Base case <= 32: one
+// reversed key-partition takes all S survivors exactly.  Same biased k as
+// part_until (the accepted pivot is a conditioned 9-sample rank estimate), but
+// the epilogue move of the forward version -- min(k, n-k) swaps, ~n/3 at large
+// n -- is gone. ----
+template <class It, class K, class Comp, class Proj>
+std::ptrdiff_t v_rev_part_until(It a, It end, K key, Comp comp, Proj proj) {
+    It lo = a;
+    while (true) {
+        if (end - lo <= 32) {
+            It m = algo_rev::sized_rev{}(lo, end, key, comp, proj);
+            return end - m;  // all S below-key survivors, in place
+        }
+        It p = detail::ninther_pos(lo, end, comp, proj);
+        std::iter_swap(lo, p);
+        auto val = std::invoke(proj, *lo);
+        It m = algo_rev::sized_rev{}(lo + 1, end, val, comp, proj);
+        std::iter_swap(lo, m - 1);  // park pivot at the right edge of the >= run
+        if (static_cast<bool>(std::invoke(comp, val, key)))
+            return end - (m - 1);  // [m-1, end) = {val} u {< val}: bottom-k, done
+        lo = m;  // val >= key: every below-key element is in [m, end)
+    }
+}
+
 // ---- rev_sample_n4 (small-n experiment): the `sample` strategy scaled down to
 // mid-size arrays -- m = min(n/4, 512) stride samples, repo quickselect for the
 // sample rank, ONE reversed partition.  Tests whether sampling can beat the
@@ -359,8 +397,15 @@ void run_one(const char* tn, const char* dn, double p, std::size_t n, const char
     auto do_work = [&] { std::ptrdiff_t kk = fn(work); bench::do_not_optimize(kk); bench::do_not_optimize(work[0]); };
     auto r = bench::measure(reps, setup, do_work, 3);
     double kos = S > 0 ? static_cast<double>(k) / static_cast<double>(S) : 0.0;
-    std::printf("%s,%s,%.2f,%zu,%s,%.4f,%.3f\n", tn, dn, p, n, algo,
-                r.min_ns / static_cast<double>(n), kos);
+    // Normalised efficiency metrics (requester): ns per DELIVERED element (k)
+    // and ns per USEFUL element min(k, S-k) -- the latter penalises a biased
+    // cut the way docs/partition_efficiency.md's E does (overshooting the S/2
+    // target shrinks the smaller side and with it the value of the split).
+    const std::ptrdiff_t mks = std::min(k, S - k);
+    double nspk = k > 0 ? r.min_ns / static_cast<double>(k) : 0.0;
+    double nspm = mks > 0 ? r.min_ns / static_cast<double>(mks) : 0.0;
+    std::printf("%s,%s,%.2f,%zu,%s,%.4f,%.3f,%.4f,%.4f\n", tn, dn, p, n, algo,
+                r.min_ns / static_cast<double>(n), kos, nspk, nspm);
     std::fflush(stdout);
 }
 
@@ -392,6 +437,7 @@ void run_type(const char* tn, Proj proj, std::size_t max_size) {
                 R("fwd_sample",   [](auto a, auto e, auto k, auto c, auto pr) { return v_sample(a, e, k, c, pr); });
                 R("sample",       [](auto a, auto e, auto k, auto c, auto pr) { return move_low_half(a, e, k, c, pr); });
                 R("part_until",   [](auto a, auto e, auto k, auto c, auto pr) { return v_part_until(a, e, k, c, pr); });
+                R("rev_part_until", [](auto a, auto e, auto k, auto c, auto pr) { return v_rev_part_until(a, e, k, c, pr); });
             }
         }
     };
@@ -415,15 +461,17 @@ void study_small(const char* tn, Proj proj) {
         for (double p : {0.25, 0.50, 0.90}) {
             auto key = percentile_key(master, p, comp, proj);
             auto R = [&](const char* nm, auto fn) {
-                std::ptrdiff_t Ssum = 0, ksum = 0;
+                std::ptrdiff_t Ssum = 0, ksum = 0, minsum = 0;
                 {  // correctness + k/S over every block
                     std::vector<T> chk = master;
                     for (std::size_t b = 0; b < blocks; ++b) {
                         auto bb = chk.begin() + static_cast<std::ptrdiff_t>(b * n);
                         std::vector<T> orig(bb, bb + n);
-                        Ssum += count_below(bb, bb + n, key, comp, proj);
+                        const std::ptrdiff_t Sb = count_below(bb, bb + n, key, comp, proj);
+                        Ssum += Sb;
                         std::ptrdiff_t k = fn(bb, bb + n);
                         ksum += k;
+                        minsum += std::min(k, Sb - k);
                         if (!check(std::vector<T>(bb, bb + n), orig, k, key, comp, proj)) {
                             std::fprintf(stderr, "WRONG small %s n=%zu p=%.2f %s blk=%zu k=%td\n",
                                          tn, n, p, nm, b, k);
@@ -449,8 +497,10 @@ void study_small(const char* tn, Proj proj) {
                 };
                 auto r = bench::measure(16, setup, do_work, 3);
                 double kos = Ssum > 0 ? static_cast<double>(ksum) / static_cast<double>(Ssum) : 0.0;
-                std::printf("%s,%zu,%.2f,%s,%.4f,%.3f\n", tn, n, p, nm,
-                            r.min_ns / static_cast<double>(pool), kos);
+                double nspk = ksum > 0 ? r.min_ns / static_cast<double>(ksum) : 0.0;
+                double nspm = minsum > 0 ? r.min_ns / static_cast<double>(minsum) : 0.0;
+                std::printf("%s,%zu,%.2f,%s,%.4f,%.3f,%.4f,%.4f\n", tn, n, p, nm,
+                            r.min_ns / static_cast<double>(pool), kos, nspk, nspm);
                 std::fflush(stdout);
             };
             R("ref",           [&](auto a, auto e) { return v_ref(a, e, key, comp, proj); });
@@ -461,6 +511,7 @@ void study_small(const char* tn, Proj proj) {
             R("rev_sample_n4", [&](auto a, auto e) { return v_rev_sample_n4(a, e, key, comp, proj); });
             R("sample",        [&](auto a, auto e) { return move_low_half(a, e, key, comp, proj); });
             R("part_until",    [&](auto a, auto e) { return v_part_until(a, e, key, comp, proj); });
+            R("rev_part_until",[&](auto a, auto e) { return v_rev_part_until(a, e, key, comp, proj); });
             R("sort_take",     [&](auto a, auto e) { return v_sort_take(a, e, key, comp, proj); });
             R("key_then_sort", [&](auto a, auto e) { return v_key_then_sort(a, e, key, comp, proj); });
         }
@@ -472,7 +523,7 @@ void study_small(const char* tn, Proj proj) {
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "large";
     if (mode == "small") {
-        std::printf("type,n,p,algo,ns_per_elem,k_over_S\n");
+        std::printf("type,n,p,algo,ns_per_elem,k_over_S,ns_per_k,ns_per_min\n");
         study_small<i64>("i64", std::identity{});
         study_small<pair64>("pair64", std::identity{});
         study_small<pair64>("pair64f", first_key{});
@@ -480,7 +531,7 @@ int main(int argc, char** argv) {
     }
     std::size_t max_size = 1u << 22;
     if (argc > 1) max_size = static_cast<std::size_t>(std::strtoull(argv[1], nullptr, 10));
-    std::printf("type,dist,p,n,algo,ns_per_elem,k_over_S\n");
+    std::printf("type,dist,p,n,algo,ns_per_elem,k_over_S,ns_per_k,ns_per_min\n");
     run_type<i64>("i64", std::identity{}, max_size);
     run_type<pair64>("pair64", std::identity{}, max_size);
     run_type<pair64>("pair64f", first_key{}, max_size);

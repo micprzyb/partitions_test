@@ -18,7 +18,7 @@ Ultra 7 165H, GCC 15.2, `-O3 -march=native`), min ns/elem, median of repeated
 runs. Files: `include/partitions/move_low_half.hpp`,
 `benchmarks/bench_move_low_half.cpp`.
 
-> **This report has two rounds.** Round 1 (the next sections) explored the
+> **This report has three rounds.** Round 1 (the next sections) explored the
 > *strategies* (sample / key-select / count-select / descend-until) with every
 > variant built on the **forward** partition plus a move-to-end epilogue.
 > Round 2 ([below](#round-2--the-reversed-formulation-kill-the-move-pass))
@@ -26,7 +26,11 @@ runs. Files: `include/partitions/move_low_half.hpp`,
 > the move pass disappear entirely — up to **1.8×** faster at high percentiles,
 > never slower beyond one ±6% cell. The shipped functions are the round-2
 > versions; round-1 numbers are kept for the strategy comparison (the *relative*
-> ordering of strategies is unchanged).
+> ordering of strategies is unchanged). Round 3
+> ([below](#round-3--part_until-revisited-reversed-measured-in-full-and-explained))
+> reverses `part_until` too, benchmarks it at every size, adds the
+> per-k / per-min(k,S−k) efficiency metrics, and explains with instrumentation
+> *why* the "biased" descent is the raw-speed leader at high percentiles.
 
 ## The shape of the problem
 
@@ -407,6 +411,151 @@ Disassembly of the shipped instantiations (i64, pair64, pair64-by-first;
 Nothing left on the table at the instruction level: the only O(n) work is the
 one partition pass (plus the select's geometric tail for the exact path), and
 that pass *is* the repo's measured-optimal partitioner.
+
+## Round 3 — `part_until` revisited: reversed, measured in full, and explained
+
+`part_until` kept showing up as the raw-speed leader at mid/high `p` while
+being "the biased one". This round (a) rebuilds it on the reversed partition
+(`rev_part_until` in the bench), (b) benchmarks it across the full matrix
+including large `n`, (c) adds two normalised metrics — **ns per delivered
+element** (`/k`) and **ns per useful element** (`/min(k, S−k)`) — and (d)
+instruments the descent to isolate *why* it is fast.
+
+### The reversed descent
+
+Mirror invariant of the forward version: **every below-key element of the whole
+array stays in the suffix `[lo, end)`** (each discarded head was `≥` some pivot
+that was `≥ key`). One reversed ninther-partition per pass, `[lo, m) ≥ val |
+[m, end) < val`, pivot parked at `m−1`. If `val < key` the suffix `[m−1, end)`
+(pivot included) is a valid bottom-k **already at the end** — return, no move.
+Else `lo = m`. Base case ≤ 32: one reversed key-partition takes all survivors
+(exact there). Removing the forward version's `move_front_to_end` (up to
+`min(k, n−k)` ≈ n/3 swaps) is worth 5–20 % at small n and up to ~35 % at
+2²²/p=0.9 (i64 0.69 → 0.49 ns/elem).
+
+### Raw results
+
+Large `n`, `random_uniform`, single calls, ns/elem (`k/S` in parens). i64:
+
+| n | p | key_select | sample | part_until (fwd) | **rev_part_until** |
+|---|---|---|---|---|---|
+| 2¹⁶ | .10 | 0.43 (.50) | **0.34** (.53) | 0.94 (.43) | 1.02 (.76) |
+| 2¹⁶ | .50 | 0.88 (.50) | **0.38** (.49) | 0.74 (.78) | 0.61 (.98) |
+| 2¹⁶ | .90 | 1.38 (.50) | 0.44 (.51) | 0.49 (.69) | **0.41** (.69) |
+| 2²⁰ | .10 | 0.51 (.50) | **0.38** (.62) | 1.05 (.42) | 1.02 (.81) |
+| 2²⁰ | .50 | 1.05 (.50) | **0.41** (.52) | 0.84 (.57) | 0.87 (.39) |
+| 2²⁰ | .90 | 1.70 (.50) | **0.49** (.52) | 0.62 (.67) | **0.49** (.67) |
+| 2²² | .10 | 0.54 (.50) | **0.45** (.52) | 1.10 (.61) | 1.17 (.64) |
+| 2²² | .50 | 0.94 (.50) | **0.51** (.49) | 0.97 (.61) | 0.78 (.79) |
+| 2²² | .90 | 1.39 (.50) | 0.48 (.48) | 0.69 (.74) | **0.49** (.74) |
+
+pair64/pair64f follow the same shape, with `rev_part_until` clearly ahead at
+p=0.9 (pair64 2²²: 0.73 vs sample 0.79; 2¹⁶: 0.57 vs 0.64). Small n
+(batched, i64): `rev_part_until` is the fastest method at every `p ≥ 0.5`
+cell from n = 128 up (0.56–0.97 ns/elem vs sample 0.9–1.9, key_select
+0.9–1.6), and beats forward `part_until` throughout.
+
+**So: is it efficient for large arrays?** Yes — but only above `p ≈ 0.75`,
+where it ties or beats the shipped `sample` (both are then a single partition
+pass; `rev_part_until` skips even the 512-sample estimator). At `p = 0.5` its
+single-call times swing wildly (0.44–0.87 ns/elem across sizes — see the
+variance discussion below), and at `p = 0.1` it does ~1.9·n work against
+`sample`'s ~1.05·n and loses 2–3×. Same verdict on `few_unique` (p=0.9: 0.46,
+the fastest; p≤0.5: up to 3× slower than `sample`).
+
+### Why is it fast? The instrumented answer
+
+Instrumenting the descent (400 calls/cell at ≤2¹⁶, 60 above; i64,
+`random_uniform`) gives:
+
+| p | passes (mean) | total work / n | accepted-pivot quantile k/n | per-call k/S 5–95 % |
+|---|---|---|---|---|
+| 0.10 | 3.7 | 1.87 | 0.065 | 0.28–0.97 |
+| 0.25 | 2.5 | 1.68 | 0.16 | 0.27–0.96 |
+| 0.50 | 1.5 | 1.33 | 0.33 | 0.30–0.96 |
+| 0.75 | 1.06 | 1.05 | 0.47 | 0.30–0.94 |
+| 0.90 | **1.00** | **1.00** | 0.50 | 0.26–0.84 |
+
+And timing a single `sized_rev` pass directly: at 2²² a pass costs the same
+per element wherever the cut lands (median-cut 0.493, key90-cut 0.486 ns/elem
+— DRAM-bound); at 2¹⁶ an extreme cut is actually *cheaper* (0.355 vs 0.428 —
+fewer misplaced elements ⇒ fewer swaps).
+
+**The core reason, stated plainly: every method's cost is (number of partition
+passes) × (cost of a pass, which is constant), plus estimator overhead — and
+`part_until` is the only method whose pass count hits the floor of 1 without
+paying any estimator.** The decomposition:
+
+1. **The task needs a cut at rank ≈ S/2, and *any* value `v < key` is a
+   certificate of a valid bottom-k.** Whenever the key is above the array
+   median (`p ≥ ~0.55`), the first ninther (≈ the array median, rank ≈ 0.5·n ≈
+   a plausible "half of below-key") is already such a value — the comparison
+   `val < key` verifies it **for free**, and the algorithm stops after exactly
+   one pass of exactly `n` elements. That is the information-theoretic floor
+   for this problem (every element must be routed once).
+2. **The "exact partition via the key" is exact at the *wrong rank*.** It cuts
+   at rank `S`, not `S/2`. The intuition that it should win confuses *exactness
+   of the partition* with *usefulness of the cut position*: after the key
+   partition you still hold an unsplit S-element set and must quickselect its
+   median — a geometric series of further passes worth ≈ 1.5–2 extra
+   full-pass-equivalents at high `p` (measured: key_select ≈ 2.8–3 pass-
+   equivalents at p=0.9 vs `rev_part_until`'s 1.0). A partition pass is never
+   "suboptimal" — all passes cost the same ~0.5 ns/elem; what varies is **how
+   many** passes a strategy needs and **where** its cut lands.
+3. **`part_until` = `sample` with m = 9.** Both are "estimate a below-key
+   value, partition once around it". `sample` pays ~512 strided reads + a
+   512-element rank-select to *know* a near-(S/2) value; `part_until` guesses
+   it from the 9 elements the ninther reads (cost ≈ 0) and retries on failure.
+   At high `p` the guess almost never fails → it strictly dominates the
+   estimator cost. At small/mid `n` the 512-sample overhead is a sizable
+   fraction of the call (at n = 2048 it touches a quarter of the array), which
+   is exactly why `part_until` led the small-n raw tables in rounds 1–2.
+4. **The price is variance, not just bias.** The accepted pivot is a
+   conditioned 9-sample estimate: per-call `k/S` spans **0.26–0.96** (5th–95th
+   pct!) at every percentile — the familiar "k/S ≈ 0.6–0.74" figures are
+   *averages over many calls*. The descent's failure retries also make the
+   *time* a random variable at mid/low `p` (1–4 passes), visible as the noisy
+   single-call large-n cells. `sample` (m = 512) holds per-call k/S to ±5 %
+   with deterministic ~1.05·n work.
+
+### Performance relative to k and to min(k, S−k)
+
+Two normalised views (now CSV columns `ns_per_k`, `ns_per_min` in both bench
+modes); i64, n = 2²², `random_uniform`:
+
+| p | metric | key_select | sample | rev_part_until |
+|---|---|---|---|---|
+| .50 | ns/elem | 0.94 | **0.51** | 0.78 |
+| .50 | ns/k | 3.75 | 2.09 | **2.00** |
+| .50 | ns/min(k,S−k) | 3.75 | **2.09** | 7.28 |
+| .90 | ns/elem | 1.39 | 0.48 | **0.49** |
+| .90 | ns/k | 3.09 | 1.11 | **0.74** |
+| .90 | ns/min(k,S−k) | 3.09 | **1.11** | 2.09 |
+
+The two metrics answer different questions and *rank the methods differently*:
+
+- **ns per k (delivered element):** `rev_part_until` is the best mover of
+  elements at mid/high `p` — its overshoot (k ≈ 0.6–0.8·S) means each pass
+  delivers *more* than asked. If the consumer just wants "a big bottom chunk
+  at the end, the more the better", this is the honest metric and
+  `rev_part_until` wins it by up to 1.5× over `sample`.
+- **ns per min(k, S−k) (useful element):** this penalises a lopsided split the
+  way `docs/partition_efficiency.md`'s E does — the value of splitting the
+  below-key set is bounded by its *smaller* side. Here `sample` wins
+  essentially everywhere at large `n` (its k ≈ S/2 maximises `min(k, S−k)`),
+  and `rev_part_until`'s 2–3× raw-speed advantage evaporates (e.g. 7.28 vs
+  2.09 at p=0.5). At small batched n and p=0.9 the bias is milder (k/S ≈ 0.56)
+  and `rev_part_until` keeps a ~1.2–1.3× edge even on this metric.
+  Caveat: in the take-all regime `S−k = 0` makes the metric degenerate (the
+  bench prints 0 there).
+
+So whether `part_until` is "actually efficient" depends on what an element of
+output is worth: per element *moved* it is the champion at `p ≥ 0.5`; per
+element of *balanced split* it is a false economy everywhere except high-`p`
+small-n. That, plus the per-call k/S lottery (0.26–0.96), is why the shipped
+functions remain `sample`/`key_select`; `rev_part_until` stays in the bench as
+the documented raw-speed reference for "any big bottom chunk will do"
+consumers.
 
 ## Shipped functions
 
