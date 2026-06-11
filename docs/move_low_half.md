@@ -18,6 +18,16 @@ Ultra 7 165H, GCC 15.2, `-O3 -march=native`), min ns/elem, median of repeated
 runs. Files: `include/partitions/move_low_half.hpp`,
 `benchmarks/bench_move_low_half.cpp`.
 
+> **This report has two rounds.** Round 1 (the next sections) explored the
+> *strategies* (sample / key-select / count-select / descend-until) with every
+> variant built on the **forward** partition plus a move-to-end epilogue.
+> Round 2 ([below](#round-2--the-reversed-formulation-kill-the-move-pass))
+> rebuilt the winners on the repo's **reversed** partition family, which makes
+> the move pass disappear entirely — up to **1.8×** faster at high percentiles,
+> never slower beyond one ±6% cell. The shipped functions are the round-2
+> versions; round-1 numbers are kept for the strategy comparison (the *relative*
+> ordering of strategies is unchanged).
+
 ## The shape of the problem
 
 The `k` smallest are the bottom `S/2` order statistics, and `S` itself is
@@ -248,9 +258,10 @@ choice, sort-based non-competitive.
 | approximate `k` ok | `part_until` | one descend, ~0.6–1.0 ns/elem |
 | any | **not** sort-based | order is wasted work |
 
-The shipped `move_low_half` already routes small `n` (< 2048) to
-`move_low_half_exact` (= `key_select`), i.e. onto the exact small-n optimum for
-`p ≲ 0.7`; `count_select` at high `p` is the only refinement, and a minor one.
+The shipped `move_low_half` routes small `n` to `move_low_half_exact`
+(= `key_select`), i.e. onto the exact small-n optimum for `p ≲ 0.7`;
+`count_select` at high `p` is the only refinement, and a minor one. (Round 2
+lowered the exact-routing threshold from 2048 to 1024 — see below.)
 
 ## Efficiency / assembler
 
@@ -264,18 +275,155 @@ is **neutral** here (the pivot is a negligible fraction of one partition) — th
 same conclusion as the quicksort work: the partition, not the pivot, is the
 budget.
 
+## Round 2 — the reversed formulation (kill the move pass)
+
+Round 1's variants all share one structural waste, pointed out by the requester:
+they partition the small elements to the **front** and then pay a
+`move_front_to_end` epilogue — `min(k, n−k)` extra swaps that exist *only*
+because the partition put the bottom set at the wrong end. At `p = 0.9` that is
+~45 % of `n` in 16-byte round-trip traffic for pairs. The repo already has the
+mirror-image partition family (`algo_rev::sized_rev`, `reverse_partition.hpp`:
+`[first, m) ≥ pivot | [m, last) < pivot`, measured at parity with forward —
+role-exchanged scans, identical op count), so the fix is to make **every**
+partition in the pipeline reversed; the bottom set then lands at the end as a
+side effect and the epilogue vanishes:
+
+- **`sample` (rev)**: stride sample → estimate the (S/2)-th value `t` → **one**
+  `sized_rev` partition; the tail `[mid, last)` *is* the answer (`k = last −
+  mid`, all `< t < key`). Bonus: the sample's rank-`r` element is now found with
+  the repo's branchless quickselect instead of `std::nth_element` (worth ~3-7 %
+  of the whole call at mid sizes).
+- **`key_select` (rev)**: `sized_rev` by `key` lands **all** `S` below-key
+  elements in the tail — the take-all base case is *already finished* at that
+  point (one pass, zero extra work). Otherwise a new **reversed quickselect**
+  (`detail::quickselect_rev`) splits the tail in place: each step parks the
+  pivot at the left edge of its `≥` run (`[first, pp) ≥ key | *pp == key |
+  [pp+1, last) < key`), recurses toward `nth = last − k`, and stops when `nth ∈
+  {pp, pp+1}` (both are valid splits since the pivot equals the boundary
+  value). The leaf is a **descending** `small_sort` network via the
+  argument-swapped comparator — a strict weak order, unlike the negation
+  `!comp`, which is reflexive and breaks sorting networks (the
+  `small_halve_rev` lesson).
+- **`rev_count_select`**: count `S` (move-free scan), then one
+  `quickselect_rev` of the whole array — the high-`p` exact alternative.
+
+Every output is verified as before (bottom-k + multiset), plus a dedicated CTest
+suite (`tests/test_move_low_half.cpp`, ~24 000 checks: exact `k`, bottom-k,
+multiset, all-below-key, take-all/empty/full edge cases, non-identity
+projection).
+
+### Large n (2²²), random high-cardinality, ns/elem
+
+| | i64 p=.10 | p=.50 | p=.90 | pair64 p=.10 | p=.50 | p=.90 | pair64f p=.10 | p=.50 | p=.90 |
+|---|---|---|---|---|---|---|---|---|---|
+| `sample` fwd (round 1) | 0.42 | 0.60 | 0.73 | 0.69 | 1.04 | 1.24 | 0.92 | 1.10 | 1.34 |
+| **`sample` rev (shipped)** | **0.43** | **0.44** | **0.48** | **0.65** | **0.74** | **0.72** | **0.67** | **0.78** | **0.76** |
+| `key_select` fwd | 0.58 | 1.25 | 1.65 | 0.88 | 1.92 | 2.60 | 0.93 | 2.01 | 2.72 |
+| **`key_select` rev (shipped)** | 0.53 | 0.90 | 1.34 | 0.86 | 1.29 | 2.01 | 0.99 | 1.38 | 2.17 |
+
+The reversed `sample` is now essentially **flat in `p`** (the residual slope of
+the forward version *was* the move pass): i64 0.43–0.48 ns/elem for *any* key
+percentile, pair64 ≤ 0.74. At `p = 0.9` the win is **1.5–1.7×** for `sample`
+and ~1.25× for the exact path; `k/S` accuracy is unchanged (same estimator).
+Across the full sweep (4 sizes × 3 percentiles × 3 types × 2 distributions) the
+reversed exact path wins or ties everywhere except two ~+6 % cells: `n = 2¹⁶,
+p = 0.9` (i64 and pair64 — the array is L2-resident there, so the forward move
+costs almost nothing and the reversed block partition gives back a few
+percent) and pair64f `n = 2²², p = 0.10` (tiny select, 7-rep min of a big
+partition — at `n = 2¹⁶` the same cell favours rev by 10 %). Localized,
+measured exceptions, not worth a size special-case (at 2¹⁶ the *approximate*
+path is 3× faster anyway).
+
+### Small n (batched, pool 2²⁰, `random_uniform`), i64 ns/elem
+
+| n | p | fwd_key_select | **key_select (rev)** | rev_count_select | **sample (shipped)** | part_until (biased) |
+|---|---|---|---|---|---|---|
+| 32 | .50 | 1.05 | **0.63** | 0.69 | 0.68 | 0.86 |
+| 64 | .50 | 1.50 | **1.36** | 1.60 | 1.37 | 1.51 |
+| 128 | .50 | 1.74 | **1.58** | 1.87 | 1.56 | 1.09 |
+| 256 | .50 | 1.51 | **1.37** | 1.60 | 1.36 | 0.89 |
+| 512 | .90 | 1.81 | 1.72 | **1.52** | 1.76 | 0.65 |
+| 1024 | .50 | 1.21 | 1.25 | 1.37 | **1.01** | 0.78 |
+| 1024 | .90 | 1.69 | 1.65 | 1.50 | **1.09** | 0.62 |
+| 2048 | .50 | 1.18 | 1.10 | 1.35 | **0.90** | 0.75 |
+| 2048 | .90 | 1.60 | 1.52 | 1.32 | **0.93** | 0.57 |
+
+(`part_until` remains the raw-speed leader at mid/high `p` but its `k/S` is
+0.56–0.67 — ~30 % over target; it stays rejected for the shipped functions.)
+
+- **n = 32 is the headline small-n win (~1.6×, 1.05 → 0.63):** every percentile
+  is in the take-all regime there, and take-all is now literally a single
+  reversed partition pass — the entire round-1 cost beyond the partition (the
+  move) was overhead.
+- At sizes where a real select runs, the reversed exact path wins by ~3–10 %
+  (the select dominates; only the move was removed). `rev_count_select` again
+  edges it at high `p` (counting is move-free), same crossover `p ≈ 0.7` as
+  round 1 — and since `p` is unknown a priori, `key_select` stays the shipped
+  exact default.
+
+### Sampling now starts at n = 1024 (was 2048)
+
+With the move gone the sample path's only remaining costs are the sample+rank
+(≈ `m` reads + an `m`-element select) and one partition, so a scaled-down sample
+`m = min(n/4, 512)` was tested down to n = 256 (`rev_sample_n4` in the bench).
+Speed: wins from n ≈ 256 at mid/high `p`. Accuracy is the constraint — measured
+**per-call** `k/S` spread (2000 trials, i64; the batched `k/S` column hides
+this because block errors average out):
+
+| n (m) | p=0.25: 5th–95th pct | p=0.50 | p=0.90 |
+|---|---|---|---|
+| 256 (64) | 0.34–0.67 | 0.38–0.63 | 0.41–0.60 |
+| 512 (128) | 0.38–0.63 | 0.41–0.59 | 0.43–0.57 |
+| 1024 (256) | 0.41–0.59 | 0.44–0.56 | 0.46–0.55 |
+| 2048 (512) | 0.44–0.56 | 0.46–0.54 | 0.47–0.53 |
+
+The median is 0.500 everywhere (stride-sampling the *original* array is
+unbiased; only the variance grows as `m` shrinks, ~`1/√(p·m)`). n = 256/512
+spreads (±25 %/±15 % at mid `p`) were judged too loose for a default; from
+n = 1024 the spread at healthy percentiles matches what the large-`n` path
+already produces at its low-`p` edge. **Shipped routing:** exact below 1024,
+`m = min(n/4, 512)` above — 10–35 % faster than round 1 at n = 1024–2048,
+identical behaviour from n = 2048 up. (Callers wanting speed at 256–1024 with
+±15–25 % `k` can lift `rev_sample_n4` from the bench.)
+
+### Efficiency / assembler (round 2)
+
+Disassembly of the shipped instantiations (i64, pair64, pair64-by-first;
+`objdump -d` of `-O3 -march=native`):
+
+- **`lomuto_branchless_rev`** (the small/mid exact hot loop): 12
+  instructions/element, the pivot stays in a register for the whole loop (the
+  by-value pivot rule — zero reloads), predicate is `cmp r9,rcx; setle` +
+  conditional add; **no data-dependent branch**. Byte-identical to the forward
+  loop except `setle` ↔ `setg`, confirming the role-exchange costs nothing.
+- **`branchless_partition_rev`** (large-n fills): exactly **one** `vpcmpgtq`
+  per vector block and **zero** `vpcmpeqq`/mask-inverts — the reversal does not
+  add a single vector op.
+- **Sample loop**: GCC vectorises the stride-4 case (n = 1024–2048) into
+  `vpcmpgtq` + `vpsubq` mask-accumulation (a branchless vector count); larger
+  strides compile to scalar `cmp/setcc/add` — load-bound either way.
+- **Ninther**: fully inlined `setg`/cmov chains, no calls, no branches.
+
+Nothing left on the table at the instruction level: the only O(n) work is the
+one partition pass (plus the select's geometric tail for the exact path), and
+that pass *is* the repo's measured-optimal partitioner.
+
 ## Shipped functions
 
-`include/partitions/move_low_half.hpp` promotes the two winners (both generic over
-`comp`/`proj`, both verified across all types/sizes/percentiles, and exercised by
-the benchmark so they cannot drift):
+`include/partitions/move_low_half.hpp` promotes the two round-2 winners (both
+generic over `comp`/`proj`, verified across all types/sizes/percentiles by the
+benchmark **and** by `tests/test_move_low_half.cpp`):
 
-- **`move_low_half(first, last, key, comp, proj)`** — the `sample` strategy: fast,
-  `k ≈ S/2` (±~4 %). The default choice for the approximate spec. Falls back to
-  the exact path for small `n` or when too few samples are below the key.
-- **`move_low_half_exact(first, last, key, comp, proj)`** — the `key_select`
-  strategy: `k = ⌊S/2⌋` exactly. Use when the count must be exact, or when the key
-  is known to be low (where it is also the fastest option).
+- **`move_low_half(first, last, key, comp, proj)`** — reversed `sample`: a
+  stride sample of the original array (`m = min(n/4, 512)`, n ≥ 1024), repo
+  quickselect for the sample rank, **one reversed partition**, done. `k ≈ S/2`
+  (per-call 5th–95th pct ≈ ±5 % at large n, see the spread table). Falls back
+  to the exact path for n < 1024 or when fewer than 16 samples are below the
+  key.
+- **`move_low_half_exact(first, last, key, comp, proj)`** — reversed
+  `key_select`: one reversed partition by `key` (which *completes* the take-all
+  base case by itself), then `detail::quickselect_rev` on the tail. `k = ⌊S/2⌋`
+  exactly.
 
 Both apply the take-all-when-small base case (`k = S` if `S/2 < 16`) and return
 `k`.

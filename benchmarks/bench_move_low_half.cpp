@@ -12,24 +12,34 @@
 // the inline `detail::ninther_pos` pivot):
 //   ref          : oracle -- count S, std::nth_element for rank k, swap to end.
 //   count_select : count S, quickselect rank k over the WHOLE array, swap.
-//   key_select   : (Approach 2, EXACT) partition by key -> S, quickselect rank k
-//                  over the below-key SUBSET only, swap.  Best exact; fastest at
-//                  LOW key percentile (small select).
+//   fwd_key_select : (Approach 2, EXACT, forward) partition by key -> S,
+//                  quickselect rank k over the below-key SUBSET only, swap.
 //   key_one_part : partition by key, then ONE median(ninther)-partition of the
 //                  remainder.  REJECTED: the ninther of a *partition-structured*
 //                  array is a biased median -> k/S swings 0.35-0.83.
-//   sample       : (the WINNER for "fast + k~=S/2") estimate the (S/2)-th value
-//                  from a stride sample of the ORIGINAL (unsorted, so UNBIASED)
-//                  array, then ONE partition around it.  ~n for ANY percentile,
-//                  k/S within ~+-4% of 0.5.
+//   fwd_sample   : estimate the (S/2)-th value from a stride sample of the
+//                  ORIGINAL (unsorted, so UNBIASED) array, then ONE forward
+//                  partition around it + a move-to-end pass.
 //   part_until   : (Approach 1, the fixed example) descend-left partitioning
 //                  while the pivot >= key, take the smaller part once the pivot
 //                  drops below key (or the range is small) -- fast at HIGH p, but
 //                  APPROXIMATE k (k/S ~ 0.6-0.74, biased high).
 //
-// The two winners are promoted to include/partitions/move_low_half.hpp:
-//   move_low_half       == `sample`     (fast, k ~= S/2)
-//   move_low_half_exact == `key_select` (exact k = floor(S/2))
+// REVERSED round (the shipped winners).  Every forward variant above ends with
+// `move_front_to_end` -- min(k, n-k) extra swaps that exist only because the
+// partition puts the bottom set at the WRONG end.  Building on the reversed
+// partition family (algo_rev::sized_rev, >= left | < right) the bottom set
+// lands at the END as a side effect of the one partition pass, and the exact
+// path's quickselect runs reversed (detail::quickselect_rev) so the answer is
+// in place when the recursion stops:
+//   sample         : sample + ONE reversed partition.  No move.  (shipped
+//                    move_low_half; the sample rank is found with the repo
+//                    quickselect, not std::nth_element)
+//   key_select     : reversed key-partition -> tail holds all S below-key; the
+//                    take-all base case is then ALREADY DONE, else reverse-
+//                    quickselect the tail in place.  (shipped move_low_half_exact)
+//   rev_count_select : count S (move-free scan), reverse-quickselect the whole
+//                    array; the high-p alternative to key_select.
 //
 // We verify each output (bottom-k property + multiset) and report k/S (how close
 // to 0.5) alongside ns/elem.  The crucial axis is the KEY PERCENTILE p (= S/n).
@@ -221,6 +231,49 @@ std::ptrdiff_t v_part_until(It a, It end, K key, Comp comp, Proj proj) {
     }
 }
 
+// ---- rev_count_select: count S (move-free), then ONE reversed quickselect of
+// the whole array puts the k smallest in the tail; take-all becomes a single
+// reversed key-partition.  The reversed twin of count_select. ----
+template <class It, class K, class Comp, class Proj>
+std::ptrdiff_t v_rev_count_select(It a, It end, K key, Comp comp, Proj proj) {
+    const std::ptrdiff_t S = count_below(a, end, key, comp, proj);
+    const auto k = target_k(S);
+    if (k <= 0) return 0;
+    if (k >= end - a) return k;
+    if (k == S) {  // take-all: one reversed partition by key lands all S at the end
+        algo_rev::sized_rev{}(a, end, key, comp, proj);
+        return k;
+    }
+    detail::quickselect_rev(a, end, end - k, comp, proj);
+    return k;
+}
+
+// ---- rev_sample_n4 (small-n experiment): the `sample` strategy scaled down to
+// mid-size arrays -- m = min(n/4, 512) stride samples, repo quickselect for the
+// sample rank, ONE reversed partition.  Tests whether sampling can beat the
+// exact path below the shipped 2048 routing threshold (accuracy degrades as
+// ~1/sqrt(p*m), so k/S is the other readout). ----
+template <class It, class K2, class Comp, class Proj>
+std::ptrdiff_t v_rev_sample_n4(It a, It end, K2 key, Comp comp, Proj proj) {
+    using K = std::remove_cvref_t<decltype(std::invoke(proj, *a))>;
+    const std::ptrdiff_t n = end - a;
+    constexpr int M = 512;
+    const int m = static_cast<int>(std::min<std::ptrdiff_t>(n / 4, M));
+    if (m < 64) return move_low_half_exact(a, end, key, comp, proj);
+    const std::ptrdiff_t stride = n / m;
+    K samp[M];
+    std::ptrdiff_t below = 0;
+    for (int i = 0; i < m; ++i) {
+        samp[i] = std::invoke(proj, a[i * stride]);
+        below += static_cast<bool>(std::invoke(comp, samp[i], key));
+    }
+    if (below < 16) return move_low_half_exact(a, end, key, comp, proj);
+    const int r = static_cast<int>(below / 2);
+    detail::quickselect(samp, samp + m, samp + r, comp, std::identity{});
+    It mid = algo_rev::sized_rev{}(a, end, samp[r], comp, proj);
+    return end - mid;
+}
+
 // ---- sort_take (small-n): full sort, the bottom k are then the front k ----
 template <class It, class K, class Comp, class Proj>
 std::ptrdiff_t v_sort_take(It a, It end, K key, Comp comp, Proj proj) {
@@ -329,10 +382,14 @@ void run_type(const char* tn, Proj proj, std::size_t max_size) {
                 R("ref",          [](auto a, auto e, auto k, auto c, auto pr) { return v_ref(a, e, k, c, pr); });
                 R("count_select", [](auto a, auto e, auto k, auto c, auto pr) { return v_count_select(a, e, k, c, pr); });
                 // key_select and sample call the PROMOTED header functions
-                // (move_low_half_exact / move_low_half) so the shipped code is
-                // what's benchmarked and cannot drift from this study.
+                // (move_low_half_exact / move_low_half, now REVERSED) so the
+                // shipped code is what's benchmarked and cannot drift from this
+                // study; fwd_* are the superseded forward+move formulations.
+                R("fwd_key_select", [](auto a, auto e, auto k, auto c, auto pr) { return v_key_select(a, e, k, c, pr); });
                 R("key_select",   [](auto a, auto e, auto k, auto c, auto pr) { return move_low_half_exact(a, e, k, c, pr); });
+                R("rev_count_select", [](auto a, auto e, auto k, auto c, auto pr) { return v_rev_count_select(a, e, k, c, pr); });
                 R("key_one_part", [](auto a, auto e, auto k, auto c, auto pr) { return v_key_one_part(a, e, k, c, pr); });
+                R("fwd_sample",   [](auto a, auto e, auto k, auto c, auto pr) { return v_sample(a, e, k, c, pr); });
                 R("sample",       [](auto a, auto e, auto k, auto c, auto pr) { return move_low_half(a, e, k, c, pr); });
                 R("part_until",   [](auto a, auto e, auto k, auto c, auto pr) { return v_part_until(a, e, k, c, pr); });
             }
@@ -352,7 +409,8 @@ void study_small(const char* tn, Proj proj) {
     const std::size_t pool = 1u << 20;
     auto master = gen_data<T>(dist::random_uniform{}, pool, 0xB00B5u, proj);
     for (std::size_t n : {std::size_t(32), std::size_t(64), std::size_t(128),
-                          std::size_t(256), std::size_t(512), std::size_t(1024)}) {
+                          std::size_t(256), std::size_t(512), std::size_t(1024),
+                          std::size_t(2048)}) {
         const std::size_t blocks = pool / n;
         for (double p : {0.25, 0.50, 0.90}) {
             auto key = percentile_key(master, p, comp, proj);
@@ -397,7 +455,11 @@ void study_small(const char* tn, Proj proj) {
             };
             R("ref",           [&](auto a, auto e) { return v_ref(a, e, key, comp, proj); });
             R("count_select",  [&](auto a, auto e) { return v_count_select(a, e, key, comp, proj); });
+            R("fwd_key_select",[&](auto a, auto e) { return v_key_select(a, e, key, comp, proj); });
             R("key_select",    [&](auto a, auto e) { return move_low_half_exact(a, e, key, comp, proj); });
+            R("rev_count_select", [&](auto a, auto e) { return v_rev_count_select(a, e, key, comp, proj); });
+            R("rev_sample_n4", [&](auto a, auto e) { return v_rev_sample_n4(a, e, key, comp, proj); });
+            R("sample",        [&](auto a, auto e) { return move_low_half(a, e, key, comp, proj); });
             R("part_until",    [&](auto a, auto e) { return v_part_until(a, e, key, comp, proj); });
             R("sort_take",     [&](auto a, auto e) { return v_sort_take(a, e, key, comp, proj); });
             R("key_then_sort", [&](auto a, auto e) { return v_key_then_sort(a, e, key, comp, proj); });
