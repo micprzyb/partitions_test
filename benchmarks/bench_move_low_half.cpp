@@ -41,6 +41,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -220,6 +221,31 @@ std::ptrdiff_t v_part_until(It a, It end, K key, Comp comp, Proj proj) {
     }
 }
 
+// ---- sort_take (small-n): full sort, the bottom k are then the front k ----
+template <class It, class K, class Comp, class Proj>
+std::ptrdiff_t v_sort_take(It a, It end, K key, Comp comp, Proj proj) {
+    quicksort(a, end, comp, proj);
+    std::ptrdiff_t S = 0;  // sorted -> below-key are the front run
+    for (It it = a; it != end &&
+                    static_cast<bool>(std::invoke(comp, std::invoke(proj, *it), key));
+         ++it)
+        ++S;
+    const auto k = target_k(S);
+    move_front_to_end(a, end, k);
+    return k;
+}
+
+// ---- key_then_sort (small-n): partition by key, SORT the below-key set, take ----
+template <class It, class K, class Comp, class Proj>
+std::ptrdiff_t v_key_then_sort(It a, It end, K key, Comp comp, Proj proj) {
+    It m = algo::sized{}(a, end, key, comp, proj);  // [a, m) < key
+    const std::ptrdiff_t S = m - a;
+    const auto k = target_k(S);
+    if (k > 0 && k < S) quicksort(a, m, comp, proj);  // sort below-key; bottom k at front
+    move_front_to_end(a, end, k);
+    return k;
+}
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -316,9 +342,80 @@ void run_type(const char* tn, Proj proj, std::size_t max_size) {
     do_dist("few_unique", dist::few_unique{});
 }
 
+// Small-n study: tiny arrays are timed BATCHED (one call is sub-clock-resolution)
+// -- split a pool into size-n blocks, run the algorithm on every block, report
+// ns/elem over the whole pool.  A single global key (percentile p of the pool) is
+// used, so each block sees S ~= p*n below-key elements.
+template <class T, class Proj>
+void study_small(const char* tn, Proj proj) {
+    auto comp = std::less<>{};
+    const std::size_t pool = 1u << 20;
+    auto master = gen_data<T>(dist::random_uniform{}, pool, 0xB00B5u, proj);
+    for (std::size_t n : {std::size_t(32), std::size_t(64), std::size_t(128),
+                          std::size_t(256), std::size_t(512), std::size_t(1024)}) {
+        const std::size_t blocks = pool / n;
+        for (double p : {0.25, 0.50, 0.90}) {
+            auto key = percentile_key(master, p, comp, proj);
+            auto R = [&](const char* nm, auto fn) {
+                std::ptrdiff_t Ssum = 0, ksum = 0;
+                {  // correctness + k/S over every block
+                    std::vector<T> chk = master;
+                    for (std::size_t b = 0; b < blocks; ++b) {
+                        auto bb = chk.begin() + static_cast<std::ptrdiff_t>(b * n);
+                        std::vector<T> orig(bb, bb + n);
+                        Ssum += count_below(bb, bb + n, key, comp, proj);
+                        std::ptrdiff_t k = fn(bb, bb + n);
+                        ksum += k;
+                        if (!check(std::vector<T>(bb, bb + n), orig, k, key, comp, proj)) {
+                            std::fprintf(stderr, "WRONG small %s n=%zu p=%.2f %s blk=%zu k=%td\n",
+                                         tn, n, p, nm, b, k);
+                            std::abort();
+                        }
+                    }
+                }
+                std::vector<T> work = master;
+                auto setup = [&] { work = master; };
+                auto do_work = [&] {
+                    for (std::size_t b = 0; b < blocks; ++b) {
+                        auto bb = work.begin() + static_cast<std::ptrdiff_t>(b * n);
+                        std::ptrdiff_t k = fn(bb, bb + n);
+                        // ANTI-FUSION BARRIER (load-bearing): do_not_optimize's
+                        // "memory" clobber stops GCC fusing/vectorising one block's
+                        // count/partition loops into the next's, which would make
+                        // batched tiny calls artificially fast.  Verified equal to
+                        // a [[gnu::noinline]] per-call build (and to no-barrier,
+                        // i.e. no fusion happens) within run-to-run noise.
+                        bench::do_not_optimize(k);
+                    }
+                    bench::do_not_optimize(work[0]);
+                };
+                auto r = bench::measure(16, setup, do_work, 3);
+                double kos = Ssum > 0 ? static_cast<double>(ksum) / static_cast<double>(Ssum) : 0.0;
+                std::printf("%s,%zu,%.2f,%s,%.4f,%.3f\n", tn, n, p, nm,
+                            r.min_ns / static_cast<double>(pool), kos);
+                std::fflush(stdout);
+            };
+            R("ref",           [&](auto a, auto e) { return v_ref(a, e, key, comp, proj); });
+            R("count_select",  [&](auto a, auto e) { return v_count_select(a, e, key, comp, proj); });
+            R("key_select",    [&](auto a, auto e) { return move_low_half_exact(a, e, key, comp, proj); });
+            R("part_until",    [&](auto a, auto e) { return v_part_until(a, e, key, comp, proj); });
+            R("sort_take",     [&](auto a, auto e) { return v_sort_take(a, e, key, comp, proj); });
+            R("key_then_sort", [&](auto a, auto e) { return v_key_then_sort(a, e, key, comp, proj); });
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    const std::string mode = argc > 1 ? argv[1] : "large";
+    if (mode == "small") {
+        std::printf("type,n,p,algo,ns_per_elem,k_over_S\n");
+        study_small<i64>("i64", std::identity{});
+        study_small<pair64>("pair64", std::identity{});
+        study_small<pair64>("pair64f", first_key{});
+        return 0;
+    }
     std::size_t max_size = 1u << 22;
     if (argc > 1) max_size = static_cast<std::size_t>(std::strtoull(argv[1], nullptr, 10));
     std::printf("type,dist,p,n,algo,ns_per_elem,k_over_S\n");

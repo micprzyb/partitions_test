@@ -156,6 +156,102 @@ elements than the requested half, whereas `sample` stays at 0.48. On accuracy
   healthy percentiles, and `below < 16` (very low `p`) falls back to the exact
   path (which is cheap there anyway).
 
+## Small arrays (n = 32 … 1024)
+
+Small `n` is a different regime: the array is L1-resident, **per-call overhead**
+and the **take-all base case** (`k = S` when `S/2 < 16`) dominate, and the
+`sample` winner is irrelevant — `move_low_half` falls back to the exact path
+below `n ≈ 2048`, so the question is purely *which exact/approximate primitive is
+cheapest at this size*. Tiny calls are timed **batched** — a pool split into
+size-`n` blocks, every block processed, ns/elem reported over the pool (`bench_move_low_half small`).
+A single global key gives each block `S ≈ p·n` below-key elements.
+
+> **Batching caveat (verified).** Batching tiny calls risks GCC *fusing* adjacent
+> blocks' loops (e.g. vectorising two blocks' counts together), which would
+> understate the per-call cost. A `do_not_optimize` **memory-clobber barrier after
+> every block call** prevents it; this was confirmed by triangulation — batched
+> with-barrier ≈ a `[[gnu::noinline]]` per-call build ≈ batched *without* barrier
+> (i.e. no fusion happens anyway, because the data-dependent partition/select
+> breaks it), all within ~5 % run-to-run noise.
+
+**`i64`, ns/elem (median of 3), `random_uniform`:**
+
+| n | key_select | count_select | part_until | sort_take | ref |
+|---|---|---|---|---|---|
+| 32 | **0.88** | 2.80 | 1.01 | 6.27 | 8.33 |
+| 64 | 1.47 | 2.52 | **1.40** | 7.40 | 7.54 |
+| 128 | 1.68 | 1.97 | **1.03** | 8.01 | 6.62 |
+| 256 | 1.47 | 1.69 | **0.90** | 8.51 | 6.13 |
+| 512 | 1.30 | 1.54 | **0.81** | 9.14 | 6.00 |
+| 1024 | 1.27 | 1.44 | **0.75** | 9.65 | 5.77 |
+
+*(p = 0.50; `part_until`'s `k/S ≈ 0.66 here — approximate. `key_select`/`count_select`/`ref` are exact.)*
+
+### Findings
+
+1. **Never sort.** `sort_take` (full `quicksort` then take the front `k`) is
+   **6–10× slower** than the selection-based methods, and `key_then_sort`
+   (partition by key, then *sort* the below-key set) is dominated — equal to
+   `key_select` only in the take-all regime (where neither sorts), and far worse
+   once a real select is needed (O(S log S) vs O(S)). You only need a *split*, so
+   paying for *order* is pure waste. This is the headline small-n lesson.
+
+2. **`std::nth_element` (`ref`) is the slowest** real contender (6–8) — its branchy
+   introselect has no answer at these sizes; the branchless quickselect is 2–6×
+   faster.
+
+3. **The take-all base case flattens the smallest sizes.** At `n = 32` every
+   percentile has `S/2 < 16`, so `k = S`: no select happens and `key_select`
+   collapses to *one key-partition + move* (~0.88, flat across `p`). The operation
+   is trivial there.
+
+4. **Exact winner is `p`-dependent**, not `n`-dependent:
+
+   | exact best | p=0.25 | p=0.50 | p=0.90 |
+   |---|---|---|---|
+   | n=64 | key_select 0.76 | key_select 1.47 | **count_select 2.42** |
+   | n=256 | key_select 1.06 | key_select 1.47 | **count_select 1.78** |
+   | n=1024 | key_select 0.93 | key_select 1.27 | **count_select 1.50** |
+
+   `key_select` wins at low/mid `p` (the key-partition isolates a small below-key
+   set, so the select is cheap). At **high `p`** the below-key set is almost the
+   whole array, so the key-partition buys nothing and its element *moves* cost more
+   than `count_select`'s move-free counting scan — `count_select` (count +
+   quickselect over the whole array) edges ahead by ~10 %. The crossover is around
+   `p ≈ 0.7`.
+
+5. **`part_until` is the fastest at every mid/high `p`** (0.6–1.0) because it is a
+   single descend — but its `k/S` is biased (0.56–0.74), so it is only the right
+   choice when an approximate `k` is acceptable. (At `n = 32` it is the take-all
+   case and `k/S = 1.0`, exact by construction.)
+
+6. **Per-call overhead shows up as `n → 32`** for the select-heavy cases: at
+   `p = 0.9`, `key_select` rises from 1.74 (n=1024) to 2.73 (n=64) ns/elem as the
+   fixed costs (the count, the pivot setup, the move) amortise over fewer elements.
+
+7. **Quickselect leaf cutoff:** sweeping the leaf where the select stops
+   partitioning and sorts a network shows **16–20 is marginally best** for these
+   small selects (n=128/p=0.9: 2.21 at cut-16 vs 2.30 at cut-24, ~3 %), the gain
+   shrinking with `n`. The shipped cutoff of 24 (the `small_sort` network max,
+   shared with the large-`n` path) is within ~2–3 %, so it is kept for simplicity.
+
+`pair64` and `pair64f` follow the same ordering with higher absolute ns (16-byte
+moves / lexicographic compares): `part_until` fastest, `key_select` the exact
+choice, sort-based non-competitive.
+
+### Tuning summary
+
+| regime | use | why |
+|---|---|---|
+| exact `k`, p ≲ 0.7 | `key_select` (= `move_low_half_exact`) | small isolated select |
+| exact `k`, p ≳ 0.7 | `count_select` | skip the key-partition's moves |
+| approximate `k` ok | `part_until` | one descend, ~0.6–1.0 ns/elem |
+| any | **not** sort-based | order is wasted work |
+
+The shipped `move_low_half` already routes small `n` (< 2048) to
+`move_low_half_exact` (= `key_select`), i.e. onto the exact small-n optimum for
+`p ≲ 0.7`; `count_select` at high `p` is the only refinement, and a minor one.
+
 ## Efficiency / assembler
 
 The hot path of *every* variant is the single `algo::sized` partition pass — the
