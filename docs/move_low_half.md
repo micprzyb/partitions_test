@@ -450,10 +450,71 @@ Large `n`, `random_uniform`, single calls, ns/elem (`k/S` in parens). i64:
 | 2²² | .90 | 1.39 (.50) | 0.48 (.48) | 0.69 (.74) | **0.49** (.74) |
 
 pair64/pair64f follow the same shape, with `rev_part_until` clearly ahead at
-p=0.9 (pair64 2²²: 0.73 vs sample 0.79; 2¹⁶: 0.57 vs 0.64). Small n
-(batched, i64): `rev_part_until` is the fastest method at every `p ≥ 0.5`
-cell from n = 128 up (0.56–0.97 ns/elem vs sample 0.9–1.9, key_select
-0.9–1.6), and beats forward `part_until` throughout.
+p=0.9 (pair64 2²²: 0.73 vs sample 0.79; 2¹⁶: 0.57 vs 0.64).
+
+#### Small n (batched, pool 2²⁰, `random_uniform`)
+
+i64, ns/elem (`k/S` in parens; `part_until`/`rev_part_until` k/S ≈ 0.66–0.72
+at p ≤ 0.5 and ≈ 0.56 at p = 0.9 unless noted; exact methods 0.500):
+
+| n | p | key_select | sample | part_until (fwd) | **rev_part_until** |
+|---|---|---|---|---|---|
+| 32 | .25 | **0.56** (1.0) | 0.66 (1.0) | 0.94 (1.0) | **0.56** (1.0) |
+| 32 | .50 | **0.56** (1.0) | 0.69 (1.0) | 0.84 (1.0) | 0.67 (1.0) |
+| 32 | .90 | 0.68 (.98) | 0.69 (.98) | 0.84 (1.0) | **0.68** (1.0) |
+| 64 | .25 | **0.55** (1.0) | 0.59 (1.0) | 1.57 (.95) | 1.52 (.95) |
+| 64 | .50 | 1.37 | 1.34 | 1.43 | **1.23** |
+| 64 | .90 | 2.51 | 2.53 | 1.08 | **0.95** |
+| 128 | .50 | 1.55 | 1.60 | 1.06 | **0.97** |
+| 128 | .90 | 2.16 | 2.15 | 0.78 | **0.62** |
+| 256 | .50 | 1.38 | 1.41 | 0.88 | **0.87** |
+| 256 | .90 | 1.86 | 1.87 | 0.67 | **0.57** |
+| 512 | .50 | 1.22 | 1.29 | 0.78 | **0.72** |
+| 512 | .90 | 1.75 | 1.75 | 0.75 | **0.59** |
+| 1024 | .25 | 0.89 | 0.94 | 0.93 | **0.88** |
+| 1024 | .50 | 1.24 | 1.01 | 0.79 | **0.76** |
+| 1024 | .90 | 1.60 | 1.09 | 0.62 | **0.59** |
+| 2048 | .50 | 1.10 | 0.94 | 0.72 | **0.66** |
+| 2048 | .90 | 1.49 | 1.03 | 0.61 | **0.56** |
+
+- `rev_part_until` is the fastest method at **every `p ≥ 0.5` cell from
+  n = 64 up** (down to 0.56 ns/elem) and beats forward `part_until` throughout
+  (5–20 %, the removed move).
+- **n = 32 is the great equalizer:** all percentiles are take-all there, and
+  the reversed descent's base case *is* `key_select`'s one reversed
+  key-partition — they measure identical (0.56–0.68). `part_until` (fwd) still
+  pays its move (0.84–0.94).
+- **The n = 64 / p = 0.25 cell is the descent's worst case in miniature**
+  (1.52 vs key_select 0.55): S = 16 means the exact path is a single take-all
+  pass, while the descent must first burn a full ninther-partition pass (whose
+  ~median pivot is ≥ key at p = 0.25), descend to ≤ 32, and only then hit the
+  base case — ~1.5 passes against 1, for nothing. Same mechanism as its
+  large-n low-`p` weakness.
+- At `p = 0.25` (n ≥ 128) it ties the exact methods rather than beating them
+  (~50 % first-pivot failure rate splits the difference).
+
+pair64 and pair64f reproduce the ordering with wider elements (pair64
+n = 2048: p=.5 1.29 vs sample 1.77, p=.9 1.09 vs 1.83; pair64f n = 1024
+p=.9: 1.30 vs 1.59); the take-all and n=64/p=.25 effects are identical.
+
+Normalised metrics, i64 (ns/k | ns/min(k,S−k); batched, so the per-block
+`min` is summed — milder bias than the single-call large-n cells):
+
+| n | p | key_select | sample | part_until (fwd) | rev_part_until |
+|---|---|---|---|---|---|
+| 256 | .50 | 5.53 \| 5.53 | 5.65 \| 5.65 | 2.63 \| 6.40 | **2.59** \| 6.30 |
+| 256 | .90 | 4.15 \| 4.15 | 4.16 \| 4.16 | 1.34 \| 2.16 | **1.14** \| **1.84** |
+| 1024 | .50 | 4.95 \| 4.95 | 4.05 \| **4.33** | 2.38 \| 5.58 | **2.30** \| 5.40 |
+| 1024 | .90 | 3.55 \| 3.55 | 2.41 \| 2.53 | 1.24 \| 2.01 | **1.18** \| **1.92** |
+| 2048 | .50 | 4.42 \| 4.42 | 3.75 \| **3.92** | 2.15 \| 5.07 | **2.04** \| 4.65 |
+| 2048 | .90 | 3.32 \| 3.32 | 2.29 \| 2.37 | 1.22 \| 1.97 | **1.12** \| **1.81** |
+
+Small-n nuance vs large n: at `p = 0.9` the batched bias is mild (k/S ≈ 0.56,
+so `min(k, S−k) ≈ 0.44·S`) and `rev_part_until` wins **both** normalised
+metrics — at these sizes it is simply the best splitter, full stop. At
+`p = 0.5` the bias (k/S ≈ 0.66) costs it the `ns/min` crown to `sample`, the
+same verdict as large n. (Take-all rows have `S−k = 0`; the bench prints 0
+and the metric is meaningless there.)
 
 **So: is it efficient for large arrays?** Yes — but only above `p ≈ 0.75`,
 where it ties or beats the shipped `sample` (both are then a single partition
