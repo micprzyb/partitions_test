@@ -48,6 +48,11 @@
 // We verify each output (bottom-k property + multiset) and report k/S (how close
 // to 0.5) alongside ns/elem.  The crucial axis is the KEY PERCENTILE p (= S/n).
 //
+// MODES: default/large = fixed-percentile single calls (n up to argv[1]);
+// `small` = fixed-percentile batched tiny blocks; `random` = random array with
+// a RANDOM key per block/run (p ~ U[0,1]), AVERAGE over many runs -- the
+// expected-cost view (see the "Mode random" comment below).
+//
 // CSV: type,dist,p,n,algo,ns_per_elem,k_over_S,ns_per_k,ns_per_min
 //   ns_per_k   = total ns / k            (cost per DELIVERED element)
 //   ns_per_min = total ns / min(k, S-k)  (cost per USEFUL element: a biased cut
@@ -55,10 +60,12 @@
 //                the split's value -- the docs/partition_efficiency.md metric)
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <random>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -518,6 +525,180 @@ void study_small(const char* tn, Proj proj) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Mode "random": EXPECTED cost under a uniformly random key.
+//
+// The fixed-percentile modes answer "how does each strategy behave at a given
+// p"; this mode answers "which strategy is best if the key is arbitrary" --
+// each run draws a fresh random array AND a fresh random key (the projected
+// key of a uniformly random element, so the key percentile p is ~U[0,1]), and
+// the AVERAGE over many runs is reported.  This is the decisive view for the
+// descend-style algorithms, whose cost is itself a random function of p
+// (1..4 passes), and it weights the regimes exactly as a random workload
+// would: take-all (~S/2<16), low p (descent-hostile), high p (descent-
+// friendly) in their natural proportions.
+//
+// Design: PAIRED -- per run all algorithms see the same array copy and the
+// same key, so the p-randomness cancels in comparisons; reported numbers are
+// aggregate ratios over all runs (sum ns / sum n, sum ns / sum k, ...), which
+// is the run-weighted average and keeps ns_per_min well-defined when single
+// runs land in the take-all regime (S-k == 0 contributes 0 to the
+// denominator).  Small n is batched (pool split into blocks, an INDEPENDENT
+// random key per block -- the per-block key loads are part of the workload),
+// timed with the same anti-fusion barrier as study_small and averaged over
+// reps; large n is single calls, mean over runs (key variance >> clock noise).
+// Verification: bottom-k on EVERY output; full multiset check on the first
+// run of each cell (the fixed-percentile modes already cover multisets
+// exhaustively).
+// ---------------------------------------------------------------------------
+
+// bottom-k check only (O(n)); the multiset half of check() is O(n log n) and
+// too slow to run on every of the thousands of large random runs.
+template <class T, class Comp, class Proj>
+bool bottom_k_ok(const std::vector<T>& v, std::ptrdiff_t k, Comp comp, Proj proj) {
+    const std::ptrdiff_t n = static_cast<std::ptrdiff_t>(v.size());
+    if (k < 0 || k > n) return false;
+    if (k == 0 || k == n) return true;
+    auto kof = [&](const T& x) { return std::invoke(proj, x); };
+    auto maxlast = kof(v[static_cast<std::size_t>(n - k)]);
+    for (std::ptrdiff_t i = n - k + 1; i < n; ++i)
+        if (static_cast<bool>(comp(maxlast, kof(v[static_cast<std::size_t>(i)]))))
+            maxlast = kof(v[static_cast<std::size_t>(i)]);
+    for (std::ptrdiff_t i = 0; i < n - k; ++i)
+        if (static_cast<bool>(comp(kof(v[static_cast<std::size_t>(i)]), maxlast)))
+            return false;
+    return true;
+}
+
+template <class T, class Proj>
+void random_small(const char* tn, Proj proj) {
+    auto comp = std::less<>{};
+    const std::size_t pool = 1u << 20;
+    auto master = gen_data<T>(dist::random_uniform{}, pool, 0xD1CE5EEDu, proj);
+    using K = std::remove_cvref_t<decltype(std::invoke(proj, master[0]))>;
+    std::mt19937_64 rng(0xD1CE5EEDu);
+    for (std::size_t n : {std::size_t(32), std::size_t(64), std::size_t(128),
+                          std::size_t(256), std::size_t(512), std::size_t(1024),
+                          std::size_t(2048)}) {
+        const std::size_t blocks = pool / n;
+        std::vector<K> keys(blocks);  // one uniformly random element key per block
+        for (std::size_t b = 0; b < blocks; ++b)
+            keys[b] = std::invoke(proj, master[b * n + rng() % n]);
+        auto R = [&](const char* nm, auto fn) {
+            std::ptrdiff_t Ssum = 0, ksum = 0, minsum = 0;
+            {  // correctness + aggregates over every block
+                std::vector<T> chk = master;
+                for (std::size_t b = 0; b < blocks; ++b) {
+                    auto bb = chk.begin() + static_cast<std::ptrdiff_t>(b * n);
+                    std::vector<T> orig(bb, bb + n);
+                    const std::ptrdiff_t Sb =
+                        count_below(bb, bb + n, keys[b], comp, proj);
+                    Ssum += Sb;
+                    std::ptrdiff_t k = fn(bb, bb + n, keys[b]);
+                    ksum += k;
+                    minsum += std::min(k, Sb - k);
+                    if (!check(std::vector<T>(bb, bb + n), orig, k, keys[b], comp, proj)) {
+                        std::fprintf(stderr, "WRONG random-small %s n=%zu %s blk=%zu k=%td\n",
+                                     tn, n, nm, b, k);
+                        std::abort();
+                    }
+                }
+            }
+            std::vector<T> work = master;
+            auto setup = [&] { work = master; };
+            auto do_work = [&] {
+                for (std::size_t b = 0; b < blocks; ++b) {
+                    auto bb = work.begin() + static_cast<std::ptrdiff_t>(b * n);
+                    std::ptrdiff_t k = fn(bb, bb + n, keys[b]);
+                    bench::do_not_optimize(k);  // anti-fusion barrier (see study_small)
+                }
+                bench::do_not_optimize(work[0]);
+            };
+            // One pool pass already AVERAGES over `blocks` independent random
+            // keys (the key randomness is inside the pass), so taking the MIN
+            // over reps keeps the expected-cost semantics while rejecting
+            // clock noise.  (A plain mean-of-reps was tried first and showed
+            // occasional 1.5-2x single-cell outliers from a slow rep --
+            // core migration / interrupts; the duplicated key_select==sample
+            // cells at n<1024 exposed it.)
+            auto r8 = bench::measure(8, setup, do_work, 2);
+            const double ns = r8.min_ns;
+            double kos = Ssum > 0 ? double(ksum) / double(Ssum) : 0.0;
+            std::printf("%s,batched,%zu,%s,%zu,%.4f,%.3f,%.4f,%.4f\n", tn, n, nm,
+                        blocks, ns / double(pool), kos,
+                        ksum > 0 ? ns / double(ksum) : 0.0,
+                        minsum > 0 ? ns / double(minsum) : 0.0);
+            std::fflush(stdout);
+        };
+        R("fwd_key_select", [&](auto a, auto e, K k) { return v_key_select(a, e, k, comp, proj); });
+        R("key_select",     [&](auto a, auto e, K k) { return move_low_half_exact(a, e, k, comp, proj); });
+        R("rev_count_select", [&](auto a, auto e, K k) { return v_rev_count_select(a, e, k, comp, proj); });
+        R("fwd_sample",     [&](auto a, auto e, K k) { return v_sample(a, e, k, comp, proj); });
+        R("sample",         [&](auto a, auto e, K k) { return move_low_half(a, e, k, comp, proj); });
+        R("part_until",     [&](auto a, auto e, K k) { return v_part_until(a, e, k, comp, proj); });
+        R("rev_part_until", [&](auto a, auto e, K k) { return v_rev_part_until(a, e, k, comp, proj); });
+    }
+}
+
+template <class T, class Proj>
+void random_large(const char* tn, Proj proj, std::size_t max_size) {
+    auto comp = std::less<>{};
+    constexpr int kAlgos = 7;
+    static const char* names[kAlgos] = {"fwd_key_select", "key_select",
+                                        "rev_count_select", "fwd_sample",
+                                        "sample", "part_until", "rev_part_until"};
+    std::mt19937_64 rng(0xACE0FBA5Eu);
+    for (std::size_t n : {std::size_t(1u << 16), std::size_t(1u << 18),
+                          std::size_t(1u << 20), std::size_t(1u << 22)}) {
+        if (n > max_size) continue;
+        const int runs = n >= (1u << 22) ? 24 : n >= (1u << 20) ? 48
+                         : n >= (1u << 18) ? 96 : 192;
+        struct Acc { double ns = 0, k = 0, S = 0, mn = 0, elems = 0; } acc[kAlgos];
+        for (int r = 0; r < runs; ++r) {
+            auto master = gen_data<T>(dist::random_uniform{}, n, 0xBA5E + 977u * r, proj);
+            const auto key = std::invoke(proj, master[rng() % n]);
+            const std::ptrdiff_t S =
+                count_below(master.begin(), master.end(), key, comp, proj);
+            std::vector<T> work;
+            auto one = [&](int i, auto fn) {
+                work = master;
+                const auto t0 = std::chrono::steady_clock::now();
+                std::ptrdiff_t k = fn(work.begin(), work.end(), key, comp, proj);
+                const auto t1 = std::chrono::steady_clock::now();
+                bench::do_not_optimize(k);
+                bench::do_not_optimize(work[0]);
+                const bool ok = r == 0 ? check(work, master, k, key, comp, proj)
+                                       : bottom_k_ok(work, k, comp, proj);
+                if (!ok) {
+                    std::fprintf(stderr, "WRONG random-large %s n=%zu %s run=%d k=%td\n",
+                                 tn, n, names[i], r, k);
+                    std::abort();
+                }
+                acc[i].ns += std::chrono::duration<double, std::nano>(t1 - t0).count();
+                acc[i].k += double(k);
+                acc[i].S += double(S);
+                acc[i].mn += double(std::min<std::ptrdiff_t>(k, S - k));
+                acc[i].elems += double(n);
+            };
+            one(0, [&](auto a, auto e, auto k, auto c, auto pr) { return v_key_select(a, e, k, c, pr); });
+            one(1, [&](auto a, auto e, auto k, auto c, auto pr) { return move_low_half_exact(a, e, k, c, pr); });
+            one(2, [&](auto a, auto e, auto k, auto c, auto pr) { return v_rev_count_select(a, e, k, c, pr); });
+            one(3, [&](auto a, auto e, auto k, auto c, auto pr) { return v_sample(a, e, k, c, pr); });
+            one(4, [&](auto a, auto e, auto k, auto c, auto pr) { return move_low_half(a, e, k, c, pr); });
+            one(5, [&](auto a, auto e, auto k, auto c, auto pr) { return v_part_until(a, e, k, c, pr); });
+            one(6, [&](auto a, auto e, auto k, auto c, auto pr) { return v_rev_part_until(a, e, k, c, pr); });
+        }
+        for (int i = 0; i < kAlgos; ++i) {
+            std::printf("%s,single,%zu,%s,%d,%.4f,%.3f,%.4f,%.4f\n", tn, n, names[i],
+                        runs, acc[i].ns / acc[i].elems,
+                        acc[i].S > 0 ? acc[i].k / acc[i].S : 0.0,
+                        acc[i].k > 0 ? acc[i].ns / acc[i].k : 0.0,
+                        acc[i].mn > 0 ? acc[i].ns / acc[i].mn : 0.0);
+            std::fflush(stdout);
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -527,6 +708,18 @@ int main(int argc, char** argv) {
         study_small<i64>("i64", std::identity{});
         study_small<pair64>("pair64", std::identity{});
         study_small<pair64>("pair64f", first_key{});
+        return 0;
+    }
+    if (mode == "random") {  // random array, RANDOM key; averages over many runs
+        std::size_t max_size = 1u << 22;
+        if (argc > 2) max_size = static_cast<std::size_t>(std::strtoull(argv[2], nullptr, 10));
+        std::printf("type,mode,n,algo,runs,ns_per_elem,k_over_S,ns_per_k,ns_per_min\n");
+        random_small<i64>("i64", std::identity{});
+        random_small<pair64>("pair64", std::identity{});
+        random_small<pair64>("pair64f", first_key{});
+        random_large<i64>("i64", std::identity{}, max_size);
+        random_large<pair64>("pair64", std::identity{}, max_size);
+        random_large<pair64>("pair64f", first_key{}, max_size);
         return 0;
     }
     std::size_t max_size = 1u << 22;

@@ -31,6 +31,10 @@ runs. Files: `include/partitions/move_low_half.hpp`,
 > reverses `part_until` too, benchmarks it at every size, adds the
 > per-k / per-min(k,S−k) efficiency metrics, and explains with instrumentation
 > *why* the "biased" descent is the raw-speed leader at high percentiles.
+> Round 4 ([below](#round-4--expected-cost-random-array-random-key)) measures
+> the **expected** cost — random array *and* random key (`p ~ U[0,1]`),
+> averaged over many runs: the descent is the best expected raw choice at
+> n = 64–2048, the shipped `sample` wins everything at large n.
 
 ## The shape of the problem
 
@@ -617,6 +621,89 @@ small-n. That, plus the per-call k/S lottery (0.26–0.96), is why the shipped
 functions remain `sample`/`key_select`; `rev_part_until` stays in the bench as
 the documented raw-speed reference for "any big bottom chunk will do"
 consumers.
+
+## Round 4 — expected cost: random array, random key
+
+The fixed-percentile modes answer "how does each strategy behave *at* a given
+`p`"; a user who does not control the key needs the **expectation over `p`**.
+New bench mode `bench_move_low_half random`: every run draws a fresh random
+array **and a fresh random key** — the projected key of a uniformly random
+element, so the key percentile is `p ~ U[0,1]` — and the **average of many
+runs** is reported. This weights take-all, low-`p` (descent-hostile) and
+high-`p` (descent-friendly) regimes exactly as a random workload would.
+
+Methodology. **Paired design**: per run all algorithms see the same array and
+key, so `p`-randomness cancels in comparisons; reported numbers are aggregate
+ratios over all runs (Σns/Σn, Σns/Σk, Σns/Σmin(k,S−k) — run-weighted averages,
+well-defined even when single runs are take-all). Small `n` is **batched**
+with an *independent random key per block* (pool 2²⁰; one pool pass therefore
+already averages over 512–32 768 random keys; we take the **min over 8
+passes**, which keeps the expected-over-keys semantics while rejecting clock
+noise — a plain mean-of-reps was tried first and produced occasional 1.5–2×
+single-cell outliers from one slow rep, caught by the duplicated
+`key_select`≡`sample` cells at n < 1024, which now agree within ~2 %). Large
+`n` is single calls, **mean over 24–192 runs** (key variance ≫ clock noise
+there). Verification: bottom-k on every output, full multiset on the first run
+of each cell.
+
+**i64, expected ns/elem (E[k/S] in parens):**
+
+| cell | fwd_key_select | key_select | rev_count_select | sample | part_until | **rev_part_until** |
+|---|---|---|---|---|---|---|
+| n=32 | 1.13 (1.0) | **0.54** (1.0) | 0.57 (1.0) | 0.57 (1.0) | 1.04 (1.0) | 0.65 (1.0) |
+| n=64 | 1.63 | 1.44 | 1.43 | 1.44 | 1.35 (.69) | **1.14** (.68) |
+| n=128 | 1.54 | 1.41 | 1.53 | 1.42 | 1.05 (.64) | **0.93** (.64) |
+| n=256 | 1.35 | 1.26 | 1.45 | 1.27 | 0.89 (.63) | **0.83** (.63) |
+| n=512 | 1.23 | 1.17 | 1.33 | 1.18 | **0.77** (.62) | 0.83 (.62) |
+| n=1024 | 1.17 | 1.14 | 1.28 | 0.92 | 0.76 (.63) | **0.72** (.62) |
+| n=2048 | 1.07 | 1.03 | 1.20 | 0.85 | 0.69 (.62) | **0.65** (.61) |
+| n=2¹⁶ | 0.97 | 0.91 | 1.03 | **0.41** | 0.62 (.61) | 0.56 (.62) |
+| n=2¹⁸ | 0.98 | 0.89 | 1.09 | **0.42** | 0.67 (.63) | 0.58 (.61) |
+| n=2²⁰ | 1.14 | 0.99 | 1.13 | **0.43** | 0.72 (.62) | 0.60 (.59) |
+| n=2²² | 1.21 | 1.07 | 1.29 | **0.47** | 0.78 (.66) | 0.64 (.65) |
+
+pair64 and pair64f reproduce the ordering exactly (pair64 n=256:
+`rev_part_until` 1.81 vs `sample` 2.62; n=2²²: `sample` 0.72 vs
+`rev_part_until` 0.94 vs `key_select` 1.65). Normalised metrics, i64:
+
+| cell | key_select ns/k \| ns/min | sample | rev_part_until |
+|---|---|---|---|
+| n=256 | 5.06 \| 5.24 | 5.07 \| 5.25 | **2.67** \| 5.63 |
+| n=1024 | 4.54 \| 4.55 | 3.66 \| **3.92** | **2.31** \| 4.71 |
+| n=2048 | 4.19 \| 4.19 | 3.46 \| **3.62** | **2.17** \| 4.25 |
+| n=2¹⁶ | 3.56 \| 3.56 | **1.58** \| **1.67** | 1.76 \| 3.63 |
+| n=2²² | 4.24 \| 4.24 | **1.90** \| **1.97** | 1.94 \| 3.97 |
+
+### Findings
+
+1. **Small n (64–2048): `rev_part_until` is the best *expected* raw choice**
+   (i64 0.65–1.14 ns/elem, 1.2–1.6× over the shipped pair), despite being the
+   worst at low `p` — the high-`p` half of the key mass, where it does exactly
+   one pass, outweighs the bounded low-`p` penalty (total descent work never
+   exceeds ~1.9·n). Its expected bias settles at **E[k/S] ≈ 0.61–0.69** with
+   the usual huge per-call spread. If approximate, biased `k` is acceptable,
+   the descent is the small-n default under unknown keys; it also wins
+   expected ns/k outright (2.2–2.7 vs 3.5–5.1).
+2. **n = 32 is take-all for every random key** (S ≤ 31 ⇒ S/2 < 16), so
+   `key_select` ≡ `sample` ≡ one reversed key-partition wins (0.54); the
+   descent measures 0.65 only because of its loop/branch frame around the
+   *identical* single partition call; the forward variants pay their move
+   (1.04–1.13).
+3. **Large n: the shipped `sample` wins every metric in expectation** — raw
+   (0.41–0.47, i.e. 1.35× ahead of `rev_part_until` and 2.2× ahead of exact),
+   per-delivered (ties the descent) and per-useful (2× better). The 512-key
+   estimator is amortised to nothing while the descent still pays
+   E[passes] ≈ 1.4; accuracy comes free on top (E[k/S] = 0.50 ± 5 % per call
+   vs 0.65 ± lottery).
+4. **Exactness costs ~2.2–2.4× in expectation at large n** (`key_select` 0.89–
+   1.07 vs `sample`): the price of nailing `k = ⌊S/2⌋` for an arbitrary key is
+   the quickselect's extra pass-equivalents, exactly as the round-3 model
+   predicts.
+5. (Artifact note: the round-1 `fwd_sample` *bench-local copy* falls back to
+   exact only below n = 256, so in the 512–2048 batched cells it stride-1
+   samples most of the block through `std::nth_element` and posts 2.0–6.1
+   ns/elem; the historical *shipped* forward function routed those sizes to
+   the exact path. The `fwd_sample` column is only meaningful at n ≥ 2¹⁶.)
 
 ## Shipped functions
 
