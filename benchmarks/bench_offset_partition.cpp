@@ -255,23 +255,159 @@ inline std::pair<std::vector<pair64>, i64> make_byfirst(std::size_t n, double f,
 }
 
 // ---------------------------------------------------------------------------
-// Mode "zero": the ZERO-OFFSET IDENTITY check.  offset == 0 is, by contract,
-// the ordinary forward partition, so `sized_off` (and the variants it routes
-// to) must match raw `algo::sized` -- here timed as `whole`, which calls
-// algo::sized directly and ignores the offset argument.  Any gap between the
-// `whole` and `sized_off` columns at f = 0 is pure dispatch/wrapper overhead
-// of the offset machinery and a bug to be explained (see the report).
+// Mode "zero": the ZERO-OFFSET OVERHEAD measurement.  offset == 0 is, by
+// contract, the ordinary forward partition, so the shipped dispatcher
+// `sized_off` must match raw `algo::sized` on the same data -- any gap is
+// pure overhead of the offset machinery.  This mode times EXACTLY that
+// head-to-head (nothing else: comparing raw against a variant the dispatcher
+// would not route to is meaningless) and prints one row per (type, n, p):
+//
+//   type,n,p,routed,raw_ns_per_elem,off0_ns_per_elem,overhead_pct,control_pct
+//
+// control_pct is the measured "overhead" of a BYTE-IDENTICAL second copy of
+// the raw kernel -- the harness noise floor (code placement of equal copies);
+// off0 overhead is only real where it exceeds the control's scatter.
+//
+// `routed` names the variant sized_off selects at offset 0 for this (T, n)
+// (gap_off below the size cutoff, prefix_fill above -- which immediately
+// falls through to algo::sized, see the header).  n < 2^16 is batched over a
+// 2^20-element pool (a single call is below clock resolution), larger sizes
+// are single calls; both sides of the comparison use identical data, the
+// same harness, and min-of-reps.
 // ---------------------------------------------------------------------------
+
+// The two zero-mode kernels are NOINLINE: inlined into the timing lambdas,
+// each side gets its own copy of the (now identical, given sized_off's
+// offset==0 early exit) partition code at a different address, and loop
+// alignment / uop-cache luck then produces +-10-27% per-cell scatter IN BOTH
+// DIRECTIONS -- visible as off0 "beating" raw, which is impossible for real
+// overhead.  Function-aligned out-of-line copies cut that variance; the
+// remaining jitter is reported as such.
+template <class It, class K, class Comp, class Proj>
+[[gnu::noinline]] It zero_raw_call(It b, It e, K key, Comp comp, Proj proj) {
+    return algo::sized{}(b, e, key, comp, proj);
+}
+template <class It, class K, class Comp, class Proj>
+[[gnu::noinline]] It zero_off0_call(It b, It e, K key, Comp comp, Proj proj) {
+    return algo_off::sized_off{}(b, e, 0, key, comp, proj);
+}
+// CONTROL: a byte-identical second copy of the raw kernel.  Its measured
+// "overhead" vs zero_raw_call is pure harness noise (code placement /
+// alignment of an equal copy), i.e. the per-cell noise floor against which
+// the off0 column must be read.
+template <class It, class K, class Comp, class Proj>
+[[gnu::noinline]] It zero_raw2_call(It b, It e, K key, Comp comp, Proj proj) {
+    return algo::sized{}(b, e, key, comp, proj);
+}
+
+// Element from a unique rank for the zero study; pair_li is bench-local
+// (types.hpp's make_value does not cover it).
+template <class T>
+T zero_elem(i64 rank, i64 idx) {
+    if constexpr (std::is_same_v<T, pair_li>) {
+        return pair_li{static_cast<long>(rank),
+                       static_cast<int>(idx & 0x7fffffff)};
+    } else if constexpr (std::is_same_v<T, pair64>) {
+        return pair64{rank, idx};  // by-first AND lex are monotone in rank
+    } else {
+        return static_cast<T>(rank);
+    }
+}
+
 template <class T, class Proj>
 void run_zero(const char* tn, Proj proj, std::size_t max_size) {
     auto comp = std::less<>{};
-    for (std::size_t n : {std::size_t(1u << 16), std::size_t(1u << 20),
-                          std::size_t(1u << 22)}) {
+    using K = std::remove_cvref_t<decltype(std::invoke(proj, T{}))>;
+    constexpr std::size_t kPool = 1u << 20;
+    for (std::size_t n :
+         {std::size_t(64), std::size_t(256), std::size_t(1024),
+          std::size_t(4096), std::size_t(16384), std::size_t(1u << 16),
+          std::size_t(1u << 18), std::size_t(1u << 20), std::size_t(1u << 22)}) {
         if (n > max_size) continue;
+        const bool batched = n < (1u << 16);
+        const std::size_t blocks = batched ? kPool / n : 1;
         for (double p : {0.10, 0.50, 0.90}) {
-            auto [master, key] = make_input<T>(
-                n, 0.0, p, 0x2E60u + n + std::size_t(p * 100) * 1009, proj);
-            bench_cell(tn, n, 0.0, p, 0, master, key, comp, proj);
+            // Each block: a fresh shuffle of ranks 0..n-1, so the key rank
+            // c = p*n (and thus the key value) is the same for every block.
+            const auto c = static_cast<i64>(p * static_cast<double>(n));
+            std::mt19937_64 rng(0x0FF5E70u + n + std::size_t(p * 100) * 1009);
+            std::vector<T> master(blocks * n);
+            std::vector<i64> ranks(n);
+            for (std::size_t b = 0; b < blocks; ++b) {
+                for (std::size_t i = 0; i < n; ++i)
+                    ranks[i] = static_cast<i64>(i);
+                std::shuffle(ranks.begin(), ranks.end(), rng);
+                for (std::size_t i = 0; i < n; ++i)
+                    master[b * n + i] =
+                        zero_elem<T>(ranks[i], static_cast<i64>(i));
+            }
+            const K key = std::invoke(proj, zero_elem<T>(c, 0));
+
+            // One timing pass over the pool for a given per-block callable.
+            auto time_one = [&](auto fn) {
+                std::vector<T> work = master;
+                {  // verify every block once: boundary == c, multiset kept
+                    for (std::size_t b = 0; b < blocks; ++b) {
+                        auto bb = work.begin() +
+                                  static_cast<std::ptrdiff_t>(b * n);
+                        std::vector<T> orig(bb, bb + n);
+                        std::ptrdiff_t m = fn(bb, bb + n) - bb;
+                        if (m != c ||
+                            !verify(std::vector<T>(bb, bb + n), orig, m, key,
+                                    comp, proj)) {
+                            std::fprintf(stderr, "WRONG zero %s n=%zu p=%.2f\n",
+                                         tn, n, p);
+                            std::abort();
+                        }
+                    }
+                }
+                auto setup = [&] { work = master; };
+                auto do_work = [&] {
+                    for (std::size_t b = 0; b < blocks; ++b) {
+                        auto bb = work.begin() +
+                                  static_cast<std::ptrdiff_t>(b * n);
+                        auto m = fn(bb, bb + n);
+                        bench::do_not_optimize(m);  // anti-fusion barrier
+                    }
+                    bench::do_not_optimize(work[0]);
+                };
+                std::uint64_t reps =
+                    batched ? 16
+                            : std::min<std::uint64_t>(
+                                  std::max<std::uint64_t>((1u << 24) / n, 9),
+                                  64);
+                auto r = bench::measure(reps, setup, do_work, 3);
+                return r.min_ns / static_cast<double>(blocks * n);
+            };
+
+            // A/B/A/B: two alternated rounds per side, min of mins, so slow
+            // drift (frequency, thermal) cannot bias one side.
+            auto raw_fn = [&](auto b, auto e) {
+                return zero_raw_call(b, e, key, comp, proj);
+            };
+            auto off0_fn = [&](auto b, auto e) {
+                return zero_off0_call(b, e, key, comp, proj);
+            };
+            auto raw2_fn = [&](auto b, auto e) {
+                return zero_raw2_call(b, e, key, comp, proj);
+            };
+            double raw = time_one(raw_fn);
+            double off0 = time_one(off0_fn);
+            double raw2 = time_one(raw2_fn);
+            raw = std::min(raw, time_one(raw_fn));
+            off0 = std::min(off0, time_one(off0_fn));
+            raw2 = std::min(raw2, time_one(raw2_fn));
+            // What algo::sized itself runs at this size (both sides take the
+            // same path: sized_off's offset==0 early exit IS algo::sized).
+            const char* routed =
+                static_cast<std::ptrdiff_t>(n) <=
+                        algo::detail::sized_cutoff<T>
+                    ? "lomuto_branchless"
+                    : "boost_block";
+            std::printf("%s,%zu,%.2f,%s,%.4f,%.4f,%+.2f,%+.2f\n", tn, n, p,
+                        routed, raw, off0, (off0 / raw - 1.0) * 100.0,
+                        (raw2 / raw - 1.0) * 100.0);
+            std::fflush(stdout);
         }
     }
 }
@@ -381,7 +517,8 @@ void run_small(const char* tn, Proj proj, double fixed_f = 0.50) {
 
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "large";
-    std::printf("type,n,f,p,algo,ns_per_elem,ns_per_suffix_elem\n");
+    if (mode != "zero")
+        std::printf("type,n,f,p,algo,ns_per_elem,ns_per_suffix_elem\n");
     if (mode == "small" || mode == "quick") {  // quick == the batched small study
         run_small<i64>("i64", std::identity{});
         run_small<pair64>("pair64", std::identity{});
@@ -394,13 +531,13 @@ int main(int argc, char** argv) {
         run_byfirst(max_size);
         return 0;
     }
-    if (mode == "zero") {  // offset == 0 identity vs the raw partition
+    if (mode == "zero") {  // offset == 0 overhead vs the raw partition
+        std::printf("type,n,p,routed,raw_ns_per_elem,off0_ns_per_elem,overhead_pct,control_pct\n");
         run_zero<pair64>("pair64f", first_key{}, max_size);
         run_zero<i64>("i64", std::identity{}, max_size);
         run_zero<pair64>("pair64", std::identity{}, max_size);
-        run_small<pair64>("pair64f", first_key{}, 0.0);
-        run_small<i64>("i64", std::identity{}, 0.0);
-        run_small<pair64>("pair64", std::identity{}, 0.0);
+        run_zero<i32>("i32", std::identity{}, max_size);
+        run_zero<pair_li>("pair_li", std::identity{}, max_size);
         return 0;
     }
     // pair64-by-first runs FIRST: it is the most important production case.

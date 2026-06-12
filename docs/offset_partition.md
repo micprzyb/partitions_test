@@ -176,50 +176,63 @@ scan_swap cells it deliberately ignores).
 
 ## Zero-offset identity (mode `zero`)
 
-`offset == 0` is, by contract, the ordinary forward partition — so the
-dispatcher must cost the same as raw `algo::sized` there, or the offset
-machinery has hidden overhead. Mode `zero` times every variant at f = 0
-against `whole` (= raw `algo::sized`, offset ignored) on identical data:
-3 types × {64…4096 batched, 2^16…2^22 single} × p ∈ {.1,.5,.9}.
+`offset == 0` is, by contract, the ordinary forward partition — so
+`offset_partition(first, last, 0, key)` must cost the same as raw
+`algo::sized(first, last, key)`, or the offset machinery has hidden overhead.
+Mode `zero` measures **exactly that head-to-head and nothing else**: raw vs
+the shipped dispatcher at offset 0, on identical data, per
+(type, n, p) cell. (Comparing raw against variants the dispatcher would not
+route to — e.g. `gap_off` at n = 2^22 — says nothing about overhead and is
+not done.)
 
-**Result: the identity holds.** Over all 63 cells, `sized_off`/raw ratio:
-mean **1.0015**, median 1.0012, σ 2.3%, extremes 0.93–1.07 *in both
-directions* (paired noise, not a one-sided tax). `prefix_fill` alone at
-offset 0, n ≥ 2^16: ratio 0.998 — statistically identical. Batched tiny
-blocks: mean 1.011, a ~1% residual at the edge of noise.
+**Coverage:** 5 element types (i32, i64, pair64 lex, pair64-by-first,
+pair_li {long,int}) × 9 sizes (64 … 2^22; n < 2^16 batched over a 2^20 pool,
+larger single calls) × p ∈ {.1, .5, .9} = 135 cells.
 
-**Why it holds, by construction (verified in the disassembly):**
+**Methodology** (this matters at tiny sizes): both kernels are out-of-line
+`[[gnu::noinline]]` functions (inlined copies inside the timing loops sat at
+different code alignments and produced ±20% per-cell scatter *in both
+directions* — including "off0 faster than raw", impossible for real
+overhead); each side is timed in two alternated rounds (A/B/A/B, min of
+mins) so frequency drift cannot bias one side; and a **control** is timed
+alongside — a byte-identical second copy of the raw kernel. The control's
+measured "overhead" is the harness noise floor (pure code-placement
+variance); the off0 column is only meaningful relative to it.
 
-* Large path: at offset 0, `sized_off` → `prefix_fill` (the narrow-type rule
-  `offset >= suffix` is false); phase 1's guard `pfx_end - lo >= 128` fails
-  on the first test, and phase 2 calls `algo::sized` on the full range. Both
-  routes bottom out in the **same out-of-line `branchless_partition`
-  instantiation** (one symbol in the probe object, called from both).
-* The phase-2 bridge degenerates safely: slots = 0 forces the
-  `swap_ranges(lo, pfx_end, …)` arm with an **empty** range — no spurious
-  self-swap (the `c_rem <= slots` arm would have been
-  `swap_ranges(first, first+c, first)`, a real in-place swap pass; the
-  branch order avoids it for every `c_rem > 0`).
-* Small path: `gap_off(offset=0)` is literally `lomuto_branchless` — same
-  11-instruction branchless body (`2 moves; cmp; setg; add`); the only
-  difference is scheduling (raw's loop software-pipelines the next `v[i]`
-  load, gap reloads at the loop top; measured parity, see the gap_off
-  columns at n ≤ 512).
+**Result: the identity holds, and the dispatcher is free at offset 0.**
 
-**One asymmetry found in standalone codegen (compare assemblers):** compiled
-as an out-of-line function, `sized_off` pays `prefix_fill`'s *hoisted* frame
-before any dispatch check runs — 64-byte stack realignment, six register
-pushes, a 0x140-byte frame for the offset buffer, and a stack-protector
-canary (`mov %fs:0x28`) — while raw `algo::sized`'s small path runs
-frameless (GCC keeps `branchless_partition` out of line there, so the lean
-path stays lean). This is ~10–15 cycles per call, **not reproduced at real
-(inlined) call sites** — the benchmark shows mean 1.0015 — and would matter
-only for a non-inlinable wrapper called at high rate on tiny arrays.
-Splitting `prefix_fill` behind `[[gnu::noinline]]` to fix the standalone
-shape was considered and **not adopted**: it trades an unconditional call
-into the hot large-n path for a cost the measurements cannot see (negative
-result, recorded). For the same reason no `offset == 0` early-exit branch
-was added to the dispatcher — there is nothing to win.
+|  | mean | median | σ | range |
+|---|---|---|---|---|
+| off0 vs raw | **+0.12%** | −0.04% | 2.5 | [−5.7%, +24.1%] |
+| control vs raw (noise floor) | −0.13% | −0.09% | 2.8 | [−13.2%, +22.7%] |
+
+The two distributions are statistically indistinguishable; **no cell** has
+\|overhead\| exceeding the control's scatter (criterion:
+\|overhead\| > 2·\|control\| + 5 pp — zero hits). Per-type means: pair64f
++0.77%, i64 −0.08%, pair64 −0.11%, i32 +0.17%, pair_li −0.17%; restricted to
+single-call sizes (n ≥ 2^16) all are within ±0.5%. The full per-cell table
+is in the appendix.
+
+**Why it holds — by construction.** `sized_off` begins with
+`if (offset == 0) return algo::sized(...)`: one perfectly-predicted branch,
+then *verbatim* the raw partition. History of that branch: it was first
+rejected ("nothing to win") because the identity already held semantically —
+`gap_off(0)` *is* `lomuto_branchless` (same 11-instruction branchless body),
+and `prefix_fill(0)` fails its phase-1 guard on the first test and falls
+through to `algo::sized` (same out-of-line `branchless_partition`
+instantiation, empty bridge `swap_ranges`). But the finer-grained overhead
+study found one **reproducible** +26% cell (pair64f, n=64 batched, p=.1,
+identical across runs): the extra inlined wrapper code shifted loop
+alignment in that instantiation context. The early exit removes the entire
+class of such artifacts — at offset 0 the codegen *is* the raw partition's —
+for the cost of one branch that is false for every real offset call.
+Standalone-codegen note (compare assemblers): without the exit, an
+out-of-line `sized_off` also paid `prefix_fill`'s hoisted frame — 64-byte
+stack realignment, six pushes, a 0x140-byte offset-buffer frame and a
+stack-protector canary (`mov %fs:0x28`) — *before* any dispatch test, while
+raw `algo::sized`'s small path runs frameless; the early exit bypasses that
+too.
+
 
 ## Assembly notes (GCC 15.2, `-O3 -march=native`, objdump of noinline probes)
 
@@ -253,6 +266,12 @@ was added to the dispatcher — there is nothing to win.
   does not fit this contract: the required front placement would re-introduce
   a `min(c, n-c)` move pass, which is never smaller than `part_swap`'s
   `min(c, offset)` bridge.
+* Measuring the zero-offset overhead with kernels inlined into the timing
+  loops: each side's copy lands at a different code alignment and the
+  per-cell "overhead" scatters ±20% in both directions on tiny blocks —
+  unusable. Out-of-line `noinline` kernels plus a byte-identical control
+  copy (the noise floor) is the working methodology; a first version of this
+  study without the control briefly misread layout luck as real overhead.
 
 ## Appendix: full benchmark results
 
@@ -522,85 +541,170 @@ values (heavy ties). Same data geometry per cell.
 
 ### Zero-offset identity, f = 0 (mode `zero`)
 
-`whole` is the raw partition baseline here; at offset 0 every variant is an
-ordinary partition, so columns differ only by per-variant constant overheads
-(gap_off above its size cutoff is the 2-moves-per-element Lomuto, hence its
-flat profile).
+Raw `algo::sized` vs `offset_partition(..., 0, key)` on identical data;
+`routed` is the inner path algo::sized takes at this size (both sides
+run it — the dispatcher's offset==0 early exit IS algo::sized).
+`control %` is a byte-identical second copy of the raw kernel — the
+code-placement noise floor; overhead is only real where it clearly
+exceeds the control, which happens in no cell. ns per element,
+min over 2×(reps) alternated rounds; n < 2^16 batched over a 2^20 pool.
 
 #### pair64f
 
-| n | p | scan_swap | gap_off | part_swap | fused_block | prefix_fill | whole | sized_off |
-|---|---|---|---|---|---|---|---|---|
-| 64 | 0.1 | 1.497 | **1.216** | 1.681 | 1.665 | 1.708 | 1.688 | 1.714 |
-| 64 | 0.5 | 3.398 | **1.202** | 1.726 | 1.752 | 1.723 | 1.706 | 1.736 |
-| 64 | 0.9 | 1.627 | 1.236 | 1.224 | 1.243 | 1.254 | **1.204** | 1.262 |
-| 256 | 0.1 | 1.466 | **0.991** | 1.338 | 1.401 | 1.362 | 1.369 | 1.357 |
-| 256 | 0.5 | 3.349 | **1.052** | 1.436 | 1.339 | 1.459 | 1.439 | 1.456 |
-| 256 | 0.9 | 1.489 | **1.029** | 1.197 | 1.331 | 1.229 | 1.204 | 1.240 |
-| 1024 | 0.1 | 1.453 | **0.886** | 1.069 | 1.054 | 1.080 | 1.070 | 1.076 |
-| 1024 | 0.5 | 3.333 | **0.858** | 1.035 | 1.008 | 1.032 | 1.024 | 1.026 |
-| 1024 | 0.9 | 1.424 | **0.892** | 1.000 | 0.998 | 0.986 | 1.007 | 1.001 |
-| 4096 | 0.1 | 1.437 | **0.763** | 0.846 | 0.810 | 0.804 | 0.816 | 0.817 |
-| 4096 | 0.5 | 3.326 | 0.773 | 0.799 | 0.771 | **0.769** | 0.781 | 0.774 |
-| 4096 | 0.9 | 1.435 | **0.762** | 0.798 | 0.780 | 0.799 | 0.793 | 0.798 |
-| 65536 | 0.1 | 1.067 | 0.522 | 0.354 | **0.335** | 0.349 | 0.353 | 0.341 |
-| 65536 | 0.5 | 2.689 | 0.486 | **0.402** | 0.405 | 0.403 | 0.406 | 0.418 |
-| 65536 | 0.9 | 0.814 | 0.494 | 0.329 | 0.334 | 0.331 | 0.329 | **0.325** |
-| 1048576 | 0.1 | 1.439 | 0.736 | 0.722 | 0.712 | 0.740 | **0.692** | 0.737 |
-| 1048576 | 0.5 | 3.273 | 0.713 | **0.675** | 0.711 | 0.697 | 0.716 | 0.708 |
-| 1048576 | 0.9 | 1.499 | 1.072 | **0.612** | 0.634 | 0.647 | 0.634 | 0.636 |
-| 4194304 | 0.1 | 1.458 | 0.897 | 0.827 | **0.757** | 0.820 | 0.832 | 0.825 |
-| 4194304 | 0.5 | 3.293 | 0.998 | **0.747** | 0.760 | 0.750 | 0.758 | 0.754 |
-| 4194304 | 0.9 | 1.556 | 1.307 | 0.802 | 0.780 | 0.770 | 0.767 | **0.751** |
+| n | p | routed | raw ns/elem | offset-0 ns/elem | overhead % | control % |
+|---|---|---|---|---|---|---|
+| 64 | 0.1 | boost_block | 1.4360 | 1.7824 | +24.12 | +22.66 |
+| 64 | 0.5 | boost_block | 1.7973 | 1.7912 | -0.34 | -0.72 |
+| 64 | 0.9 | boost_block | 1.2931 | 1.2929 | -0.01 | -0.15 |
+| 256 | 0.1 | boost_block | 1.7659 | 1.7665 | +0.03 | +0.19 |
+| 256 | 0.5 | boost_block | 1.4821 | 1.4798 | -0.16 | -0.34 |
+| 256 | 0.9 | boost_block | 1.6307 | 1.6204 | -0.63 | -0.32 |
+| 1024 | 0.1 | boost_block | 1.0859 | 1.0903 | +0.40 | +0.17 |
+| 1024 | 0.5 | boost_block | 1.0800 | 1.0773 | -0.26 | -0.04 |
+| 1024 | 0.9 | boost_block | 1.0240 | 1.0285 | +0.44 | +0.06 |
+| 4096 | 0.1 | boost_block | 0.8447 | 0.8363 | -0.99 | -0.71 |
+| 4096 | 0.5 | boost_block | 0.8394 | 0.8453 | +0.71 | -1.40 |
+| 4096 | 0.9 | boost_block | 0.8502 | 0.8514 | +0.14 | -1.03 |
+| 16384 | 0.1 | boost_block | 0.7767 | 0.7861 | +1.21 | +2.24 |
+| 16384 | 0.5 | boost_block | 0.7546 | 0.7749 | +2.70 | +1.21 |
+| 16384 | 0.9 | boost_block | 0.7729 | 0.7658 | -0.91 | -0.71 |
+| 65536 | 0.1 | boost_block | 0.3660 | 0.3609 | -1.38 | -1.24 |
+| 65536 | 0.5 | boost_block | 0.4245 | 0.4341 | +2.27 | +3.63 |
+| 65536 | 0.9 | boost_block | 0.3627 | 0.3583 | -1.22 | -2.61 |
+| 262144 | 0.1 | boost_block | 0.3832 | 0.3768 | -1.67 | -1.67 |
+| 262144 | 0.5 | boost_block | 0.4543 | 0.4529 | -0.31 | +0.32 |
+| 262144 | 0.9 | boost_block | 0.4020 | 0.3828 | -4.77 | -5.46 |
+| 1048576 | 0.1 | boost_block | 0.7451 | 0.7485 | +0.47 | +5.17 |
+| 1048576 | 0.5 | boost_block | 0.7411 | 0.7349 | -0.84 | -5.28 |
+| 1048576 | 0.9 | boost_block | 0.7026 | 0.7306 | +3.99 | +2.33 |
+| 4194304 | 0.1 | boost_block | 0.8272 | 0.7942 | -3.98 | -13.24 |
+| 4194304 | 0.5 | boost_block | 0.7730 | 0.7726 | -0.04 | -1.60 |
+| 4194304 | 0.9 | boost_block | 0.7150 | 0.7282 | +1.84 | +1.41 |
 
 #### i64
 
-| n | p | scan_swap | gap_off | part_swap | fused_block | prefix_fill | whole | sized_off |
-|---|---|---|---|---|---|---|---|---|
-| 64 | 0.1 | 1.173 | **0.473** | 0.519 | 0.878 | 0.564 | 0.490 | 0.490 |
-| 64 | 0.5 | 2.946 | 0.485 | 0.512 | 0.834 | 0.553 | 0.486 | **0.482** |
-| 64 | 0.9 | 1.190 | 0.544 | 0.566 | 0.975 | 0.584 | **0.518** | 0.546 |
-| 256 | 0.1 | 1.131 | 0.469 | 0.462 | 0.660 | 0.474 | **0.454** | 0.457 |
-| 256 | 0.5 | 2.931 | 0.455 | 0.458 | 0.591 | 0.469 | 0.489 | **0.455** |
-| 256 | 0.9 | 1.037 | 0.476 | 0.474 | 0.700 | 0.479 | **0.451** | 0.470 |
-| 1024 | 0.1 | 1.130 | 0.459 | 0.410 | 0.411 | 0.417 | **0.409** | 0.411 |
-| 1024 | 0.5 | 2.809 | **0.472** | 0.475 | 0.512 | 0.474 | 0.484 | 0.484 |
-| 1024 | 0.9 | 0.979 | 0.461 | **0.408** | 0.411 | 0.429 | 0.413 | 0.411 |
-| 4096 | 0.1 | 1.139 | 0.517 | 0.370 | 0.379 | 0.423 | **0.365** | 0.374 |
-| 4096 | 0.5 | 2.933 | 0.461 | 0.428 | **0.418** | 0.472 | 0.427 | 0.427 |
-| 4096 | 0.9 | 1.109 | 0.470 | 0.385 | 0.374 | **0.373** | 0.389 | 0.376 |
-| 65536 | 0.1 | 1.073 | 0.460 | 0.337 | 0.342 | **0.332** | 0.337 | 0.334 |
-| 65536 | 0.5 | 2.804 | 0.469 | 0.414 | **0.385** | 0.389 | 0.412 | 0.393 |
-| 65536 | 0.9 | 1.014 | 0.442 | **0.312** | 0.321 | 0.320 | 0.313 | 0.318 |
-| 1048576 | 0.1 | 1.121 | 0.486 | 0.340 | 0.345 | 0.348 | **0.339** | 0.348 |
-| 1048576 | 0.5 | 2.863 | 0.481 | 0.405 | 0.425 | 0.405 | 0.407 | **0.404** |
-| 1048576 | 0.9 | 1.073 | 0.474 | 0.340 | 0.343 | 0.346 | **0.340** | 0.342 |
-| 4194304 | 0.1 | 1.263 | 0.491 | 0.448 | 0.470 | **0.439** | 0.461 | 0.443 |
-| 4194304 | 0.5 | 3.106 | 0.518 | 0.497 | 0.500 | **0.487** | 0.489 | 0.499 |
-| 4194304 | 0.9 | 1.269 | 0.665 | **0.420** | 0.423 | 0.428 | 0.429 | 0.428 |
+| n | p | routed | raw ns/elem | offset-0 ns/elem | overhead % | control % |
+|---|---|---|---|---|---|---|
+| 64 | 0.1 | lomuto_branchless | 0.5819 | 0.5806 | -0.22 | +0.04 |
+| 64 | 0.5 | lomuto_branchless | 0.5737 | 0.5714 | -0.40 | +0.84 |
+| 64 | 0.9 | lomuto_branchless | 0.6016 | 0.6023 | +0.12 | -0.09 |
+| 256 | 0.1 | lomuto_branchless | 0.4926 | 0.4912 | -0.29 | -0.23 |
+| 256 | 0.5 | lomuto_branchless | 0.4928 | 0.4857 | -1.45 | -0.92 |
+| 256 | 0.9 | lomuto_branchless | 0.4979 | 0.4898 | -1.63 | +3.85 |
+| 1024 | 0.1 | boost_block | 0.4293 | 0.4310 | +0.41 | +2.04 |
+| 1024 | 0.5 | boost_block | 0.5105 | 0.4976 | -2.52 | -1.21 |
+| 1024 | 0.9 | boost_block | 0.4379 | 0.4471 | +2.10 | +0.92 |
+| 4096 | 0.1 | boost_block | 0.3935 | 0.4024 | +2.24 | +3.33 |
+| 4096 | 0.5 | boost_block | 0.4569 | 0.4567 | -0.04 | -0.94 |
+| 4096 | 0.9 | boost_block | 0.4016 | 0.4023 | +0.18 | +0.37 |
+| 16384 | 0.1 | boost_block | 0.3778 | 0.3764 | -0.37 | -0.18 |
+| 16384 | 0.5 | boost_block | 0.4436 | 0.4363 | -1.64 | -1.59 |
+| 16384 | 0.9 | boost_block | 0.3792 | 0.3741 | -1.34 | +1.54 |
+| 65536 | 0.1 | boost_block | 0.3409 | 0.3406 | -0.10 | -0.37 |
+| 65536 | 0.5 | boost_block | 0.4148 | 0.4175 | +0.66 | -0.27 |
+| 65536 | 0.9 | boost_block | 0.3322 | 0.3326 | +0.13 | -0.00 |
+| 262144 | 0.1 | boost_block | 0.3537 | 0.3498 | -1.08 | +0.01 |
+| 262144 | 0.5 | boost_block | 0.4287 | 0.4281 | -0.14 | -0.67 |
+| 262144 | 0.9 | boost_block | 0.3588 | 0.3802 | +5.96 | -0.63 |
+| 1048576 | 0.1 | boost_block | 0.3699 | 0.3736 | +0.99 | +2.29 |
+| 1048576 | 0.5 | boost_block | 0.4327 | 0.4313 | -0.33 | +0.94 |
+| 1048576 | 0.9 | boost_block | 0.3708 | 0.3707 | -0.03 | +0.51 |
+| 4194304 | 0.1 | boost_block | 0.4335 | 0.4424 | +2.06 | -1.24 |
+| 4194304 | 0.5 | boost_block | 0.4920 | 0.4932 | +0.23 | -0.21 |
+| 4194304 | 0.9 | boost_block | 0.4547 | 0.4286 | -5.74 | -8.04 |
 
 #### pair64
 
-| n | p | scan_swap | gap_off | part_swap | fused_block | prefix_fill | whole | sized_off |
-|---|---|---|---|---|---|---|---|---|
-| 64 | 0.1 | **1.863** | 3.721 | 1.906 | 1.892 | 1.978 | 1.960 | 1.911 |
-| 64 | 0.5 | 3.744 | 3.734 | **1.907** | 1.958 | 1.927 | 1.909 | 1.928 |
-| 64 | 0.9 | 1.863 | 3.729 | 1.484 | 1.708 | 1.512 | **1.483** | 1.489 |
-| 256 | 0.1 | 1.730 | 4.147 | 1.209 | 1.223 | **1.174** | 1.191 | 1.232 |
-| 256 | 0.5 | 3.659 | 4.147 | 1.113 | 1.157 | 1.107 | **1.098** | 1.108 |
-| 256 | 0.9 | 1.850 | 4.146 | 1.312 | 1.353 | 1.309 | **1.301** | 1.326 |
-| 1024 | 0.1 | 3.151 | 5.537 | 2.553 | **2.491** | 2.548 | 2.558 | 2.558 |
-| 1024 | 0.5 | 3.706 | 5.542 | 2.554 | **2.506** | 2.564 | 2.562 | 2.574 |
-| 1024 | 0.9 | 2.877 | 5.540 | 2.491 | **2.455** | 2.468 | 2.465 | 2.465 |
-| 4096 | 0.1 | 1.823 | 4.572 | 1.341 | **1.312** | 1.341 | 1.349 | 1.339 |
-| 4096 | 0.5 | 3.648 | 4.593 | 1.361 | 1.367 | **1.347** | 1.356 | 1.351 |
-| 4096 | 0.9 | 1.696 | 4.566 | 1.301 | 1.302 | 1.310 | **1.293** | 1.301 |
-| 65536 | 0.1 | 1.097 | 0.652 | **0.462** | 0.468 | 0.471 | 0.471 | 0.477 |
-| 65536 | 0.5 | 2.798 | 0.669 | 0.511 | 0.510 | **0.507** | 0.511 | 0.508 |
-| 65536 | 0.9 | 0.969 | 0.646 | 0.459 | 0.456 | **0.453** | 0.465 | 0.456 |
-| 1048576 | 0.1 | 1.573 | 0.759 | 0.668 | 0.664 | 0.663 | 0.664 | **0.662** |
-| 1048576 | 0.5 | 3.388 | 0.738 | 0.616 | 0.646 | 0.621 | 0.636 | **0.608** |
-| 1048576 | 0.9 | 1.500 | 1.052 | **0.631** | 0.678 | 0.673 | 0.638 | 0.647 |
-| 4194304 | 0.1 | 1.587 | 0.912 | 0.678 | 0.678 | **0.666** | 0.685 | 0.668 |
-| 4194304 | 0.5 | 3.490 | 1.014 | 0.657 | **0.647** | 0.664 | 0.659 | 0.662 |
-| 4194304 | 0.9 | 1.599 | 1.317 | 0.679 | 0.681 | **0.676** | 0.679 | 0.679 |
+| n | p | routed | raw ns/elem | offset-0 ns/elem | overhead % | control % |
+|---|---|---|---|---|---|---|
+| 64 | 0.1 | boost_block | 1.9196 | 1.9206 | +0.05 | +0.27 |
+| 64 | 0.5 | boost_block | 1.8286 | 1.8075 | -1.15 | -1.32 |
+| 64 | 0.9 | boost_block | 1.6044 | 1.6013 | -0.19 | -0.09 |
+| 256 | 0.1 | boost_block | 1.2243 | 1.2313 | +0.56 | -2.21 |
+| 256 | 0.5 | boost_block | 1.0768 | 1.0928 | +1.49 | +0.83 |
+| 256 | 0.9 | boost_block | 1.2953 | 1.3012 | +0.46 | +0.81 |
+| 1024 | 0.1 | boost_block | 1.1752 | 1.1713 | -0.33 | -0.11 |
+| 1024 | 0.5 | boost_block | 1.0914 | 1.0893 | -0.18 | +0.27 |
+| 1024 | 0.9 | boost_block | 1.0246 | 1.0278 | +0.32 | +1.12 |
+| 4096 | 0.1 | boost_block | 0.8268 | 0.8261 | -0.08 | +0.06 |
+| 4096 | 0.5 | boost_block | 0.7722 | 0.7662 | -0.78 | -1.63 |
+| 4096 | 0.9 | boost_block | 0.7935 | 0.7902 | -0.42 | +0.16 |
+| 16384 | 0.1 | boost_block | 0.7666 | 0.7612 | -0.71 | -0.84 |
+| 16384 | 0.5 | boost_block | 0.6899 | 0.6773 | -1.83 | -3.02 |
+| 16384 | 0.9 | boost_block | 0.6962 | 0.6929 | -0.49 | +0.44 |
+| 65536 | 0.1 | boost_block | 0.5048 | 0.5085 | +0.74 | +0.22 |
+| 65536 | 0.5 | boost_block | 0.5396 | 0.5373 | -0.43 | -0.33 |
+| 65536 | 0.9 | boost_block | 0.4818 | 0.4802 | -0.33 | +0.27 |
+| 262144 | 0.1 | boost_block | 0.5109 | 0.5088 | -0.42 | +0.23 |
+| 262144 | 0.5 | boost_block | 0.5624 | 0.5470 | -2.73 | -2.96 |
+| 262144 | 0.9 | boost_block | 0.4860 | 0.4926 | +1.35 | +3.00 |
+| 1048576 | 0.1 | boost_block | 0.6829 | 0.6777 | -0.75 | -0.45 |
+| 1048576 | 0.5 | boost_block | 0.6227 | 0.6235 | +0.13 | -0.89 |
+| 1048576 | 0.9 | boost_block | 0.6498 | 0.6490 | -0.12 | -0.51 |
+| 4194304 | 0.1 | boost_block | 0.6893 | 0.6877 | -0.23 | +0.10 |
+| 4194304 | 0.5 | boost_block | 0.6608 | 0.6774 | +2.52 | +0.70 |
+| 4194304 | 0.9 | boost_block | 0.6792 | 0.6838 | +0.67 | -0.07 |
+
+#### i32
+
+| n | p | routed | raw ns/elem | offset-0 ns/elem | overhead % | control % |
+|---|---|---|---|---|---|---|
+| 64 | 0.1 | lomuto_branchless | 0.5589 | 0.5652 | +1.13 | +1.53 |
+| 64 | 0.5 | lomuto_branchless | 0.5660 | 0.5662 | +0.03 | +0.76 |
+| 64 | 0.9 | lomuto_branchless | 0.5872 | 0.5865 | -0.11 | +0.20 |
+| 256 | 0.1 | lomuto_branchless | 0.4795 | 0.4770 | -0.52 | -0.71 |
+| 256 | 0.5 | lomuto_branchless | 0.4815 | 0.4746 | -1.43 | -1.24 |
+| 256 | 0.9 | lomuto_branchless | 0.4812 | 0.4810 | -0.04 | +0.58 |
+| 1024 | 0.1 | boost_block | 0.4051 | 0.4017 | -0.85 | -0.84 |
+| 1024 | 0.5 | boost_block | 0.4781 | 0.4833 | +1.10 | +0.02 |
+| 1024 | 0.9 | boost_block | 0.4122 | 0.4147 | +0.62 | +0.32 |
+| 4096 | 0.1 | boost_block | 0.3758 | 0.3749 | -0.24 | -0.36 |
+| 4096 | 0.5 | boost_block | 0.4484 | 0.4513 | +0.64 | -0.06 |
+| 4096 | 0.9 | boost_block | 0.3794 | 0.3801 | +0.18 | +0.29 |
+| 16384 | 0.1 | boost_block | 0.3569 | 0.3554 | -0.41 | -1.73 |
+| 16384 | 0.5 | boost_block | 0.4310 | 0.4315 | +0.12 | +1.92 |
+| 16384 | 0.9 | boost_block | 0.3512 | 0.3540 | +0.79 | +0.63 |
+| 65536 | 0.1 | boost_block | 0.3305 | 0.3315 | +0.31 | +0.13 |
+| 65536 | 0.5 | boost_block | 0.4097 | 0.4106 | +0.22 | -1.90 |
+| 65536 | 0.9 | boost_block | 0.3292 | 0.3301 | +0.27 | -0.88 |
+| 262144 | 0.1 | boost_block | 0.3380 | 0.3371 | -0.24 | -0.56 |
+| 262144 | 0.5 | boost_block | 0.4142 | 0.4142 | +0.01 | -0.07 |
+| 262144 | 0.9 | boost_block | 0.3367 | 0.3368 | +0.03 | +1.13 |
+| 1048576 | 0.1 | boost_block | 0.3489 | 0.3514 | +0.71 | +1.04 |
+| 1048576 | 0.5 | boost_block | 0.4254 | 0.4251 | -0.07 | -1.28 |
+| 1048576 | 0.9 | boost_block | 0.3511 | 0.3510 | -0.02 | -0.44 |
+| 4194304 | 0.1 | boost_block | 0.3723 | 0.3768 | +1.22 | -0.83 |
+| 4194304 | 0.5 | boost_block | 0.4333 | 0.4375 | +0.98 | +0.03 |
+| 4194304 | 0.9 | boost_block | 0.3665 | 0.3674 | +0.27 | +0.35 |
+
+#### pair_li
+
+| n | p | routed | raw ns/elem | offset-0 ns/elem | overhead % | control % |
+|---|---|---|---|---|---|---|
+| 64 | 0.1 | boost_block | 2.0813 | 2.0487 | -1.56 | -1.41 |
+| 64 | 0.5 | boost_block | 1.8530 | 1.8521 | -0.05 | -0.43 |
+| 64 | 0.9 | boost_block | 1.5713 | 1.5626 | -0.55 | -0.98 |
+| 256 | 0.1 | boost_block | 1.8048 | 1.7892 | -0.87 | -1.13 |
+| 256 | 0.5 | boost_block | 1.6380 | 1.6546 | +1.02 | -0.13 |
+| 256 | 0.9 | boost_block | 1.8409 | 1.8004 | -2.20 | -1.47 |
+| 1024 | 0.1 | boost_block | 1.1685 | 1.1653 | -0.27 | -0.54 |
+| 1024 | 0.5 | boost_block | 1.1550 | 1.1514 | -0.31 | -0.66 |
+| 1024 | 0.9 | boost_block | 1.0542 | 1.0705 | +1.55 | +1.89 |
+| 4096 | 0.1 | boost_block | 0.8426 | 0.8324 | -1.21 | -3.35 |
+| 4096 | 0.5 | boost_block | 0.8182 | 0.8059 | -1.51 | -1.61 |
+| 4096 | 0.9 | boost_block | 0.7892 | 0.7846 | -0.58 | -0.09 |
+| 16384 | 0.1 | boost_block | 0.7633 | 0.7622 | -0.14 | -0.26 |
+| 16384 | 0.5 | boost_block | 0.6933 | 0.6964 | +0.45 | +0.32 |
+| 16384 | 0.9 | boost_block | 0.7012 | 0.7073 | +0.87 | -2.24 |
+| 65536 | 0.1 | boost_block | 0.4726 | 0.4742 | +0.33 | +0.49 |
+| 65536 | 0.5 | boost_block | 0.5934 | 0.5872 | -1.04 | -0.88 |
+| 65536 | 0.9 | boost_block | 0.4882 | 0.4847 | -0.71 | -1.31 |
+| 262144 | 0.1 | boost_block | 0.4855 | 0.4872 | +0.34 | +1.11 |
+| 262144 | 0.5 | boost_block | 0.5789 | 0.5824 | +0.61 | +0.58 |
+| 262144 | 0.9 | boost_block | 0.4914 | 0.4907 | -0.13 | -0.03 |
+| 1048576 | 0.1 | boost_block | 0.6636 | 0.6635 | -0.02 | -0.89 |
+| 1048576 | 0.5 | boost_block | 0.6331 | 0.6402 | +1.14 | +0.19 |
+| 1048576 | 0.9 | boost_block | 0.6515 | 0.6414 | -1.55 | -0.22 |
+| 4194304 | 0.1 | boost_block | 0.6813 | 0.6837 | +0.35 | +0.43 |
+| 4194304 | 0.5 | boost_block | 0.6729 | 0.6795 | +0.99 | +1.25 |
+| 4194304 | 0.9 | boost_block | 0.6858 | 0.6888 | +0.43 | -0.56 |
