@@ -12,7 +12,8 @@ set(PARTITIONS_TEST_FILES
     test_pivot_partition.cpp
     test_distributions.cpp
     test_statistics.cpp
-    test_move_low_half.cpp)
+    test_move_low_half.cpp
+    test_offset_partition.cpp)
 
 foreach(test_src IN LISTS PARTITIONS_TEST_FILES)
     get_filename_component(test_name ${test_src} NAME_WE)
