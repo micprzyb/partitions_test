@@ -3,7 +3,7 @@
 # (unsigned long long) printf casts etc. are benchmark-local noise.
 
 # ---- Always-build benchmarks (no external dependencies) -------------------
-foreach(bench_src bench_partition.cpp bench_partition_methods.cpp bench_partition_efficiency.cpp bench_pivot.cpp bench_pivot_total.cpp bench_large_n.cpp bench_small_merge.cpp bench_small_halve.cpp bench_quickselect.cpp bench_quicksort.cpp bench_quicksort_lr.cpp bench_move_low_half.cpp bench_halver_compare.cpp bench_pivot_tiers.cpp bench_reverse_partition.cpp bench_offset_partition.cpp)
+foreach(bench_src bench_partition.cpp bench_partition_methods.cpp bench_partition_efficiency.cpp bench_pivot.cpp bench_pivot_total.cpp bench_large_n.cpp bench_small_merge.cpp bench_small_halve.cpp bench_quickselect.cpp bench_quicksort.cpp bench_quicksort_lr.cpp bench_move_low_half.cpp bench_halver_compare.cpp bench_pivot_tiers.cpp bench_reverse_partition.cpp bench_offset_partition.cpp bench_offset_low_half.cpp)
     get_filename_component(bench_name ${bench_src} NAME_WE)
     add_executable(${bench_name} ${bench_src})
     target_include_directories(${bench_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
