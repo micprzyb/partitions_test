@@ -176,62 +176,70 @@ scan_swap cells it deliberately ignores).
 
 ## Zero-offset identity (mode `zero`)
 
-`offset == 0` is, by contract, the ordinary forward partition — so
-`offset_partition(first, last, 0, key)` must cost the same as raw
-`algo::sized(first, last, key)`, or the offset machinery has hidden overhead.
-Mode `zero` measures **exactly that head-to-head and nothing else**: raw vs
-the shipped dispatcher at offset 0, on identical data, per
-(type, n, p) cell. (Comparing raw against variants the dispatcher would not
-route to — e.g. `gap_off` at n = 2^22 — says nothing about overhead and is
-not done.)
+`offset == 0` is, by contract, the ordinary forward partition. The offset
+machinery is only correctly engineered if the **real dispatched algorithms**
+— `gap_off(0)` below the size cutoff, `prefix_fill(0)` above, exactly what
+`sized_off` routes to — cost the same as raw `algo::sized` on the same data.
+Mode `zero` measures that head-to-head and nothing else. There is
+deliberately **no `offset == 0` special case** in the dispatcher: an early
+exit calling `algo::sized` would make this benchmark circular (raw vs raw
+through a wrapper) and prove nothing about the offset algorithms. (One was
+briefly added during this study and removed for exactly that reason.)
+
+**Why parity is expected, by construction:**
+
+* `gap_off(0)` **is** `algo::lomuto_branchless` — the same 11-instruction
+  branchless gap loop, merely entered with a runtime start index that
+  happens to be 0;
+* `prefix_fill(0)` fails its phase-1 guard (`pfx_end - lo >= 128`) on the
+  first test and runs phase 2 = `algo::sized` on the full range — the same
+  out-of-line `branchless_partition` instantiation raw uses — plus an empty
+  bridge `swap_ranges`.
 
 **Coverage:** 5 element types (i32, i64, pair64 lex, pair64-by-first,
-pair_li {long,int}) × 9 sizes (64 … 2^22; n < 2^16 batched over a 2^20 pool,
-larger single calls) × p ∈ {.1, .5, .9} = 135 cells.
+pair_li {long,int}) × 9 sizes (64 … 2^22; n < 2^16 batched over a 2^20
+pool, larger single calls) × p ∈ {.1, .5, .9} = 135 cells.
 
-**Methodology** (this matters at tiny sizes): both kernels are out-of-line
-`[[gnu::noinline]]` functions (inlined copies inside the timing loops sat at
-different code alignments and produced ±20% per-cell scatter *in both
-directions* — including "off0 faster than raw", impossible for real
-overhead); each side is timed in two alternated rounds (A/B/A/B, min of
-mins) so frequency drift cannot bias one side; and a **control** is timed
-alongside — a byte-identical second copy of the raw kernel. The control's
-measured "overhead" is the harness noise floor (pure code-placement
-variance); the off0 column is only meaningful relative to it.
+**Methodology** (it matters at tiny sizes): both kernels are out-of-line
+`[[gnu::noinline]]` functions — inlined copies inside the timing loops sat
+at different code alignments and produced ±20% per-cell scatter *in both
+directions*, including "off0 faster than raw", impossible for real
+overhead. Each side is timed in two alternated rounds (A/B/A/B, min of
+mins) so frequency drift cannot bias one side, and a **control** is timed
+alongside: a byte-identical second copy of the raw kernel. The control's
+measured "overhead" is the per-cell noise floor (pure code placement); the
+off0 column is only meaningful relative to it.
 
-**Result: the identity holds, and the dispatcher is free at offset 0.**
+**Result: the real algorithms are at parity with the raw partition.**
 
 |  | mean | median | σ | range |
 |---|---|---|---|---|
-| off0 vs raw | **+0.12%** | −0.04% | 2.5 | [−5.7%, +24.1%] |
-| control vs raw (noise floor) | −0.13% | −0.09% | 2.8 | [−13.2%, +22.7%] |
+| off0 (real route) vs raw | **−0.25%** | −0.13% | 4.5 | [−21.2%, +25.3%] |
+| control vs raw (noise floor) | −0.31% | +0.09% | 3.8 | [−17.1%, +22.3%] |
 
-The two distributions are statistically indistinguishable; **no cell** has
-\|overhead\| exceeding the control's scatter (criterion:
-\|overhead\| > 2·\|control\| + 5 pp — zero hits). Per-type means: pair64f
-+0.77%, i64 −0.08%, pair64 −0.11%, i32 +0.17%, pair_li −0.17%; restricted to
-single-call sizes (n ≥ 2^16) all are within ±0.5%. The full per-cell table
-is in the appendix.
+Split by what actually runs: `gap_off`-routed cells mean −1.5% (control
+−1.2%), `prefix_fill`-routed mean −0.13% (control −0.22%). Five cells
+nominally exceed the control band (|overhead| > |control| + 4 pp), but
+three of them have off0 *faster* by 8–21% — impossible for genuine
+overhead — and the two positive ones flipped sign in the previous build of
+the same source: all five are the ±15–20% code-placement flips the control
+column exists to expose, not systematic cost. Per-type overhead means:
+pair64f −0.33%, i64 +0.46%, pair64 −0.67%, i32 −0.55%, pair_li −0.18% —
+each within a fraction of a percent of its control. The full per-cell
+table is in the appendix.
 
-**Why it holds — by construction.** `sized_off` begins with
-`if (offset == 0) return algo::sized(...)`: one perfectly-predicted branch,
-then *verbatim* the raw partition. History of that branch: it was first
-rejected ("nothing to win") because the identity already held semantically —
-`gap_off(0)` *is* `lomuto_branchless` (same 11-instruction branchless body),
-and `prefix_fill(0)` fails its phase-1 guard on the first test and falls
-through to `algo::sized` (same out-of-line `branchless_partition`
-instantiation, empty bridge `swap_ranges`). But the finer-grained overhead
-study found one **reproducible** +26% cell (pair64f, n=64 batched, p=.1,
-identical across runs): the extra inlined wrapper code shifted loop
-alignment in that instantiation context. The early exit removes the entire
-class of such artifacts — at offset 0 the codegen *is* the raw partition's —
-for the cost of one branch that is false for every real offset call.
-Standalone-codegen note (compare assemblers): without the exit, an
-out-of-line `sized_off` also paid `prefix_fill`'s hoisted frame — 64-byte
-stack realignment, six pushes, a 0x140-byte offset-buffer frame and a
-stack-protector canary (`mov %fs:0x28`) — *before* any dispatch test, while
-raw `algo::sized`'s small path runs frameless; the early exit bypasses that
-too.
+**Standalone-codegen note (compare assemblers).** As separately compiled
+out-of-line functions, the two entry points are *not* byte-identical:
+`sized_off` carries `prefix_fill`'s hoisted frame — 64-byte stack
+realignment, six pushes, a 0x140-byte offset-buffer frame, and a
+stack-protector canary (`mov %fs:0x28`) — executed before the dispatch
+tests, while raw `algo::sized`'s small path runs frameless. That is
+~10–15 cycles per call. The measurements above bound its real-world effect
+at the noise floor even for 64-element batched calls; it would only matter
+for a non-inlinable wrapper hammered with tiny arrays, and the fix (a
+`noinline` split of `prefix_fill`'s body) is documented but not applied —
+it would add an unconditional call to the hot large-n path to fix a cost
+the data cannot detect.
 
 
 ## Assembly notes (GCC 15.2, `-O3 -march=native`, objdump of noinline probes)
@@ -541,170 +549,170 @@ values (heavy ties). Same data geometry per cell.
 
 ### Zero-offset identity, f = 0 (mode `zero`)
 
-Raw `algo::sized` vs `offset_partition(..., 0, key)` on identical data;
-`routed` is the inner path algo::sized takes at this size (both sides
-run it — the dispatcher's offset==0 early exit IS algo::sized).
-`control %` is a byte-identical second copy of the raw kernel — the
-code-placement noise floor; overhead is only real where it clearly
-exceeds the control, which happens in no cell. ns per element,
-min over 2×(reps) alternated rounds; n < 2^16 batched over a 2^20 pool.
+Raw `algo::sized` vs the dispatcher's REAL route at offset 0
+(`routed`: gap_off below the size cutoff, prefix_fill above — no
+offset==0 special case exists). `control %` is a byte-identical
+second copy of the raw kernel: the code-placement noise floor;
+overhead is only real where it clearly exceeds the control, which
+happens in no cell (see the analysis above). ns per element, min over
+2× alternated rounds; n < 2^16 batched over a 2^20 pool.
 
 #### pair64f
 
 | n | p | routed | raw ns/elem | offset-0 ns/elem | overhead % | control % |
 |---|---|---|---|---|---|---|
-| 64 | 0.1 | boost_block | 1.4360 | 1.7824 | +24.12 | +22.66 |
-| 64 | 0.5 | boost_block | 1.7973 | 1.7912 | -0.34 | -0.72 |
-| 64 | 0.9 | boost_block | 1.2931 | 1.2929 | -0.01 | -0.15 |
-| 256 | 0.1 | boost_block | 1.7659 | 1.7665 | +0.03 | +0.19 |
-| 256 | 0.5 | boost_block | 1.4821 | 1.4798 | -0.16 | -0.34 |
-| 256 | 0.9 | boost_block | 1.6307 | 1.6204 | -0.63 | -0.32 |
-| 1024 | 0.1 | boost_block | 1.0859 | 1.0903 | +0.40 | +0.17 |
-| 1024 | 0.5 | boost_block | 1.0800 | 1.0773 | -0.26 | -0.04 |
-| 1024 | 0.9 | boost_block | 1.0240 | 1.0285 | +0.44 | +0.06 |
-| 4096 | 0.1 | boost_block | 0.8447 | 0.8363 | -0.99 | -0.71 |
-| 4096 | 0.5 | boost_block | 0.8394 | 0.8453 | +0.71 | -1.40 |
-| 4096 | 0.9 | boost_block | 0.8502 | 0.8514 | +0.14 | -1.03 |
-| 16384 | 0.1 | boost_block | 0.7767 | 0.7861 | +1.21 | +2.24 |
-| 16384 | 0.5 | boost_block | 0.7546 | 0.7749 | +2.70 | +1.21 |
-| 16384 | 0.9 | boost_block | 0.7729 | 0.7658 | -0.91 | -0.71 |
-| 65536 | 0.1 | boost_block | 0.3660 | 0.3609 | -1.38 | -1.24 |
-| 65536 | 0.5 | boost_block | 0.4245 | 0.4341 | +2.27 | +3.63 |
-| 65536 | 0.9 | boost_block | 0.3627 | 0.3583 | -1.22 | -2.61 |
-| 262144 | 0.1 | boost_block | 0.3832 | 0.3768 | -1.67 | -1.67 |
-| 262144 | 0.5 | boost_block | 0.4543 | 0.4529 | -0.31 | +0.32 |
-| 262144 | 0.9 | boost_block | 0.4020 | 0.3828 | -4.77 | -5.46 |
-| 1048576 | 0.1 | boost_block | 0.7451 | 0.7485 | +0.47 | +5.17 |
-| 1048576 | 0.5 | boost_block | 0.7411 | 0.7349 | -0.84 | -5.28 |
-| 1048576 | 0.9 | boost_block | 0.7026 | 0.7306 | +3.99 | +2.33 |
-| 4194304 | 0.1 | boost_block | 0.8272 | 0.7942 | -3.98 | -13.24 |
-| 4194304 | 0.5 | boost_block | 0.7730 | 0.7726 | -0.04 | -1.60 |
-| 4194304 | 0.9 | boost_block | 0.7150 | 0.7282 | +1.84 | +1.41 |
+| 64 | 0.1 | prefix_fill | 1.4403 | 1.8047 | +25.30 | +22.34 |
+| 64 | 0.5 | prefix_fill | 1.7615 | 1.7566 | -0.28 | -2.40 |
+| 64 | 0.9 | prefix_fill | 1.2352 | 1.2300 | -0.42 | +3.05 |
+| 256 | 0.1 | prefix_fill | 1.7422 | 1.7810 | +2.23 | +0.29 |
+| 256 | 0.5 | prefix_fill | 1.4752 | 1.4667 | -0.58 | +0.13 |
+| 256 | 0.9 | prefix_fill | 1.6560 | 1.6860 | +1.82 | +0.85 |
+| 1024 | 0.1 | prefix_fill | 1.0916 | 1.0905 | -0.10 | -0.62 |
+| 1024 | 0.5 | prefix_fill | 1.0775 | 1.0798 | +0.21 | +0.06 |
+| 1024 | 0.9 | prefix_fill | 1.0025 | 1.0096 | +0.71 | +0.95 |
+| 4096 | 0.1 | prefix_fill | 0.8429 | 0.8380 | -0.58 | -0.05 |
+| 4096 | 0.5 | prefix_fill | 0.8138 | 0.8108 | -0.37 | +0.73 |
+| 4096 | 0.9 | prefix_fill | 0.8403 | 0.8393 | -0.12 | +0.09 |
+| 16384 | 0.1 | prefix_fill | 0.7657 | 0.7711 | +0.70 | +1.23 |
+| 16384 | 0.5 | prefix_fill | 0.7587 | 0.7632 | +0.59 | +1.12 |
+| 16384 | 0.9 | prefix_fill | 0.7605 | 0.7711 | +1.40 | +0.74 |
+| 65536 | 0.1 | prefix_fill | 0.3794 | 0.4413 | +16.30 | -8.26 |
+| 65536 | 0.5 | prefix_fill | 0.4796 | 0.4291 | -10.52 | -10.43 |
+| 65536 | 0.9 | prefix_fill | 0.4535 | 0.3615 | -20.29 | -16.08 |
+| 262144 | 0.1 | prefix_fill | 0.4059 | 0.3981 | -1.92 | -1.48 |
+| 262144 | 0.5 | prefix_fill | 0.4961 | 0.4800 | -3.24 | -9.60 |
+| 262144 | 0.9 | prefix_fill | 0.4758 | 0.3747 | -21.24 | -7.77 |
+| 1048576 | 0.1 | prefix_fill | 0.7452 | 0.7629 | +2.39 | -0.32 |
+| 1048576 | 0.5 | prefix_fill | 0.7352 | 0.7272 | -1.09 | -1.87 |
+| 1048576 | 0.9 | prefix_fill | 0.7286 | 0.7344 | +0.80 | -1.12 |
+| 4194304 | 0.1 | prefix_fill | 0.8183 | 0.8370 | +2.29 | +2.57 |
+| 4194304 | 0.5 | prefix_fill | 0.7606 | 0.7512 | -1.24 | +2.06 |
+| 4194304 | 0.9 | prefix_fill | 0.7271 | 0.7151 | -1.66 | -3.17 |
 
 #### i64
 
 | n | p | routed | raw ns/elem | offset-0 ns/elem | overhead % | control % |
 |---|---|---|---|---|---|---|
-| 64 | 0.1 | lomuto_branchless | 0.5819 | 0.5806 | -0.22 | +0.04 |
-| 64 | 0.5 | lomuto_branchless | 0.5737 | 0.5714 | -0.40 | +0.84 |
-| 64 | 0.9 | lomuto_branchless | 0.6016 | 0.6023 | +0.12 | -0.09 |
-| 256 | 0.1 | lomuto_branchless | 0.4926 | 0.4912 | -0.29 | -0.23 |
-| 256 | 0.5 | lomuto_branchless | 0.4928 | 0.4857 | -1.45 | -0.92 |
-| 256 | 0.9 | lomuto_branchless | 0.4979 | 0.4898 | -1.63 | +3.85 |
-| 1024 | 0.1 | boost_block | 0.4293 | 0.4310 | +0.41 | +2.04 |
-| 1024 | 0.5 | boost_block | 0.5105 | 0.4976 | -2.52 | -1.21 |
-| 1024 | 0.9 | boost_block | 0.4379 | 0.4471 | +2.10 | +0.92 |
-| 4096 | 0.1 | boost_block | 0.3935 | 0.4024 | +2.24 | +3.33 |
-| 4096 | 0.5 | boost_block | 0.4569 | 0.4567 | -0.04 | -0.94 |
-| 4096 | 0.9 | boost_block | 0.4016 | 0.4023 | +0.18 | +0.37 |
-| 16384 | 0.1 | boost_block | 0.3778 | 0.3764 | -0.37 | -0.18 |
-| 16384 | 0.5 | boost_block | 0.4436 | 0.4363 | -1.64 | -1.59 |
-| 16384 | 0.9 | boost_block | 0.3792 | 0.3741 | -1.34 | +1.54 |
-| 65536 | 0.1 | boost_block | 0.3409 | 0.3406 | -0.10 | -0.37 |
-| 65536 | 0.5 | boost_block | 0.4148 | 0.4175 | +0.66 | -0.27 |
-| 65536 | 0.9 | boost_block | 0.3322 | 0.3326 | +0.13 | -0.00 |
-| 262144 | 0.1 | boost_block | 0.3537 | 0.3498 | -1.08 | +0.01 |
-| 262144 | 0.5 | boost_block | 0.4287 | 0.4281 | -0.14 | -0.67 |
-| 262144 | 0.9 | boost_block | 0.3588 | 0.3802 | +5.96 | -0.63 |
-| 1048576 | 0.1 | boost_block | 0.3699 | 0.3736 | +0.99 | +2.29 |
-| 1048576 | 0.5 | boost_block | 0.4327 | 0.4313 | -0.33 | +0.94 |
-| 1048576 | 0.9 | boost_block | 0.3708 | 0.3707 | -0.03 | +0.51 |
-| 4194304 | 0.1 | boost_block | 0.4335 | 0.4424 | +2.06 | -1.24 |
-| 4194304 | 0.5 | boost_block | 0.4920 | 0.4932 | +0.23 | -0.21 |
-| 4194304 | 0.9 | boost_block | 0.4547 | 0.4286 | -5.74 | -8.04 |
+| 64 | 0.1 | gap_off | 0.5713 | 0.5600 | -1.98 | +2.79 |
+| 64 | 0.5 | gap_off | 0.5786 | 0.5737 | -0.83 | +1.01 |
+| 64 | 0.9 | gap_off | 0.6350 | 0.5836 | -8.10 | -2.52 |
+| 256 | 0.1 | gap_off | 0.4792 | 0.4781 | -0.22 | +0.53 |
+| 256 | 0.5 | gap_off | 0.5756 | 0.5492 | -4.58 | -17.12 |
+| 256 | 0.9 | gap_off | 0.4905 | 0.4698 | -4.20 | -2.19 |
+| 1024 | 0.1 | prefix_fill | 0.4278 | 0.4246 | -0.76 | -0.80 |
+| 1024 | 0.5 | prefix_fill | 0.4897 | 0.4945 | +0.99 | -0.10 |
+| 1024 | 0.9 | prefix_fill | 0.4378 | 0.4385 | +0.17 | +0.26 |
+| 4096 | 0.1 | prefix_fill | 0.3900 | 0.3900 | +0.01 | +1.74 |
+| 4096 | 0.5 | prefix_fill | 0.4451 | 0.4463 | +0.26 | +1.16 |
+| 4096 | 0.9 | prefix_fill | 0.3844 | 0.4431 | +15.26 | -0.06 |
+| 16384 | 0.1 | prefix_fill | 0.3654 | 0.3649 | -0.12 | +1.49 |
+| 16384 | 0.5 | prefix_fill | 0.4296 | 0.4338 | +0.98 | -1.10 |
+| 16384 | 0.9 | prefix_fill | 0.3713 | 0.3631 | -2.20 | +0.06 |
+| 65536 | 0.1 | prefix_fill | 0.3320 | 0.3374 | +1.62 | -0.55 |
+| 65536 | 0.5 | prefix_fill | 0.4069 | 0.4080 | +0.27 | -0.04 |
+| 65536 | 0.9 | prefix_fill | 0.3227 | 0.3324 | +3.01 | +0.47 |
+| 262144 | 0.1 | prefix_fill | 0.3434 | 0.3420 | -0.41 | +0.51 |
+| 262144 | 0.5 | prefix_fill | 0.4143 | 0.4177 | +0.83 | +0.41 |
+| 262144 | 0.9 | prefix_fill | 0.3389 | 0.3396 | +0.20 | +2.11 |
+| 1048576 | 0.1 | prefix_fill | 0.3572 | 0.3583 | +0.28 | +2.35 |
+| 1048576 | 0.5 | prefix_fill | 0.4257 | 0.4371 | +2.68 | +2.65 |
+| 1048576 | 0.9 | prefix_fill | 0.3567 | 0.3648 | +2.27 | +2.51 |
+| 4194304 | 0.1 | prefix_fill | 0.4284 | 0.4291 | +0.15 | +1.99 |
+| 4194304 | 0.5 | prefix_fill | 0.4756 | 0.4851 | +1.99 | +0.71 |
+| 4194304 | 0.9 | prefix_fill | 0.4291 | 0.4503 | +4.96 | +1.81 |
 
 #### pair64
 
 | n | p | routed | raw ns/elem | offset-0 ns/elem | overhead % | control % |
 |---|---|---|---|---|---|---|
-| 64 | 0.1 | boost_block | 1.9196 | 1.9206 | +0.05 | +0.27 |
-| 64 | 0.5 | boost_block | 1.8286 | 1.8075 | -1.15 | -1.32 |
-| 64 | 0.9 | boost_block | 1.6044 | 1.6013 | -0.19 | -0.09 |
-| 256 | 0.1 | boost_block | 1.2243 | 1.2313 | +0.56 | -2.21 |
-| 256 | 0.5 | boost_block | 1.0768 | 1.0928 | +1.49 | +0.83 |
-| 256 | 0.9 | boost_block | 1.2953 | 1.3012 | +0.46 | +0.81 |
-| 1024 | 0.1 | boost_block | 1.1752 | 1.1713 | -0.33 | -0.11 |
-| 1024 | 0.5 | boost_block | 1.0914 | 1.0893 | -0.18 | +0.27 |
-| 1024 | 0.9 | boost_block | 1.0246 | 1.0278 | +0.32 | +1.12 |
-| 4096 | 0.1 | boost_block | 0.8268 | 0.8261 | -0.08 | +0.06 |
-| 4096 | 0.5 | boost_block | 0.7722 | 0.7662 | -0.78 | -1.63 |
-| 4096 | 0.9 | boost_block | 0.7935 | 0.7902 | -0.42 | +0.16 |
-| 16384 | 0.1 | boost_block | 0.7666 | 0.7612 | -0.71 | -0.84 |
-| 16384 | 0.5 | boost_block | 0.6899 | 0.6773 | -1.83 | -3.02 |
-| 16384 | 0.9 | boost_block | 0.6962 | 0.6929 | -0.49 | +0.44 |
-| 65536 | 0.1 | boost_block | 0.5048 | 0.5085 | +0.74 | +0.22 |
-| 65536 | 0.5 | boost_block | 0.5396 | 0.5373 | -0.43 | -0.33 |
-| 65536 | 0.9 | boost_block | 0.4818 | 0.4802 | -0.33 | +0.27 |
-| 262144 | 0.1 | boost_block | 0.5109 | 0.5088 | -0.42 | +0.23 |
-| 262144 | 0.5 | boost_block | 0.5624 | 0.5470 | -2.73 | -2.96 |
-| 262144 | 0.9 | boost_block | 0.4860 | 0.4926 | +1.35 | +3.00 |
-| 1048576 | 0.1 | boost_block | 0.6829 | 0.6777 | -0.75 | -0.45 |
-| 1048576 | 0.5 | boost_block | 0.6227 | 0.6235 | +0.13 | -0.89 |
-| 1048576 | 0.9 | boost_block | 0.6498 | 0.6490 | -0.12 | -0.51 |
-| 4194304 | 0.1 | boost_block | 0.6893 | 0.6877 | -0.23 | +0.10 |
-| 4194304 | 0.5 | boost_block | 0.6608 | 0.6774 | +2.52 | +0.70 |
-| 4194304 | 0.9 | boost_block | 0.6792 | 0.6838 | +0.67 | -0.07 |
+| 64 | 0.1 | prefix_fill | 1.9293 | 1.9412 | +0.62 | -0.79 |
+| 64 | 0.5 | prefix_fill | 1.7969 | 1.8123 | +0.86 | +0.14 |
+| 64 | 0.9 | prefix_fill | 1.5951 | 1.5738 | -1.34 | +0.16 |
+| 256 | 0.1 | prefix_fill | 1.2401 | 1.2267 | -1.08 | -0.54 |
+| 256 | 0.5 | prefix_fill | 1.0731 | 1.0618 | -1.05 | -0.57 |
+| 256 | 0.9 | prefix_fill | 1.2774 | 1.2676 | -0.77 | -0.73 |
+| 1024 | 0.1 | prefix_fill | 1.1635 | 1.1492 | -1.23 | -1.12 |
+| 1024 | 0.5 | prefix_fill | 1.1022 | 1.0878 | -1.31 | -2.04 |
+| 1024 | 0.9 | prefix_fill | 1.0393 | 1.0409 | +0.16 | +1.35 |
+| 4096 | 0.1 | prefix_fill | 0.8420 | 0.8281 | -1.65 | -0.67 |
+| 4096 | 0.5 | prefix_fill | 0.7832 | 0.7751 | -1.03 | -1.34 |
+| 4096 | 0.9 | prefix_fill | 0.7855 | 0.7798 | -0.73 | -1.16 |
+| 16384 | 0.1 | prefix_fill | 0.7580 | 0.7638 | +0.77 | -0.32 |
+| 16384 | 0.5 | prefix_fill | 0.6869 | 0.6851 | -0.26 | -0.54 |
+| 16384 | 0.9 | prefix_fill | 0.7050 | 0.7006 | -0.62 | +0.12 |
+| 65536 | 0.1 | prefix_fill | 0.5116 | 0.5045 | -1.40 | -0.05 |
+| 65536 | 0.5 | prefix_fill | 0.5296 | 0.5306 | +0.19 | +0.77 |
+| 65536 | 0.9 | prefix_fill | 0.4819 | 0.4750 | -1.42 | +0.08 |
+| 262144 | 0.1 | prefix_fill | 0.5142 | 0.5053 | -1.71 | +0.41 |
+| 262144 | 0.5 | prefix_fill | 0.5333 | 0.5264 | -1.29 | +0.54 |
+| 262144 | 0.9 | prefix_fill | 0.4862 | 0.4890 | +0.58 | -2.13 |
+| 1048576 | 0.1 | prefix_fill | 0.6872 | 0.6757 | -1.67 | -0.08 |
+| 1048576 | 0.5 | prefix_fill | 0.6320 | 0.6129 | -3.03 | +0.20 |
+| 1048576 | 0.9 | prefix_fill | 0.6471 | 0.6557 | +1.33 | +1.51 |
+| 4194304 | 0.1 | prefix_fill | 0.6957 | 0.6896 | -0.87 | -0.88 |
+| 4194304 | 0.5 | prefix_fill | 0.6636 | 0.6645 | +0.12 | +1.38 |
+| 4194304 | 0.9 | prefix_fill | 0.6835 | 0.6823 | -0.18 | +0.80 |
 
 #### i32
 
 | n | p | routed | raw ns/elem | offset-0 ns/elem | overhead % | control % |
 |---|---|---|---|---|---|---|
-| 64 | 0.1 | lomuto_branchless | 0.5589 | 0.5652 | +1.13 | +1.53 |
-| 64 | 0.5 | lomuto_branchless | 0.5660 | 0.5662 | +0.03 | +0.76 |
-| 64 | 0.9 | lomuto_branchless | 0.5872 | 0.5865 | -0.11 | +0.20 |
-| 256 | 0.1 | lomuto_branchless | 0.4795 | 0.4770 | -0.52 | -0.71 |
-| 256 | 0.5 | lomuto_branchless | 0.4815 | 0.4746 | -1.43 | -1.24 |
-| 256 | 0.9 | lomuto_branchless | 0.4812 | 0.4810 | -0.04 | +0.58 |
-| 1024 | 0.1 | boost_block | 0.4051 | 0.4017 | -0.85 | -0.84 |
-| 1024 | 0.5 | boost_block | 0.4781 | 0.4833 | +1.10 | +0.02 |
-| 1024 | 0.9 | boost_block | 0.4122 | 0.4147 | +0.62 | +0.32 |
-| 4096 | 0.1 | boost_block | 0.3758 | 0.3749 | -0.24 | -0.36 |
-| 4096 | 0.5 | boost_block | 0.4484 | 0.4513 | +0.64 | -0.06 |
-| 4096 | 0.9 | boost_block | 0.3794 | 0.3801 | +0.18 | +0.29 |
-| 16384 | 0.1 | boost_block | 0.3569 | 0.3554 | -0.41 | -1.73 |
-| 16384 | 0.5 | boost_block | 0.4310 | 0.4315 | +0.12 | +1.92 |
-| 16384 | 0.9 | boost_block | 0.3512 | 0.3540 | +0.79 | +0.63 |
-| 65536 | 0.1 | boost_block | 0.3305 | 0.3315 | +0.31 | +0.13 |
-| 65536 | 0.5 | boost_block | 0.4097 | 0.4106 | +0.22 | -1.90 |
-| 65536 | 0.9 | boost_block | 0.3292 | 0.3301 | +0.27 | -0.88 |
-| 262144 | 0.1 | boost_block | 0.3380 | 0.3371 | -0.24 | -0.56 |
-| 262144 | 0.5 | boost_block | 0.4142 | 0.4142 | +0.01 | -0.07 |
-| 262144 | 0.9 | boost_block | 0.3367 | 0.3368 | +0.03 | +1.13 |
-| 1048576 | 0.1 | boost_block | 0.3489 | 0.3514 | +0.71 | +1.04 |
-| 1048576 | 0.5 | boost_block | 0.4254 | 0.4251 | -0.07 | -1.28 |
-| 1048576 | 0.9 | boost_block | 0.3511 | 0.3510 | -0.02 | -0.44 |
-| 4194304 | 0.1 | boost_block | 0.3723 | 0.3768 | +1.22 | -0.83 |
-| 4194304 | 0.5 | boost_block | 0.4333 | 0.4375 | +0.98 | +0.03 |
-| 4194304 | 0.9 | boost_block | 0.3665 | 0.3674 | +0.27 | +0.35 |
+| 64 | 0.1 | gap_off | 0.5635 | 0.5644 | +0.16 | +0.40 |
+| 64 | 0.5 | gap_off | 0.5628 | 0.5689 | +1.09 | +0.97 |
+| 64 | 0.9 | gap_off | 0.5808 | 0.5871 | +1.08 | +0.83 |
+| 256 | 0.1 | gap_off | 0.4780 | 0.4755 | -0.53 | -0.69 |
+| 256 | 0.5 | gap_off | 0.4763 | 0.4738 | -0.51 | -0.75 |
+| 256 | 0.9 | gap_off | 0.4775 | 0.4791 | +0.33 | +2.50 |
+| 1024 | 0.1 | prefix_fill | 0.4071 | 0.4027 | -1.07 | +1.48 |
+| 1024 | 0.5 | prefix_fill | 0.4866 | 0.4807 | -1.21 | -1.03 |
+| 1024 | 0.9 | prefix_fill | 0.4241 | 0.4231 | -0.23 | -1.76 |
+| 4096 | 0.1 | prefix_fill | 0.3749 | 0.3774 | +0.68 | +6.01 |
+| 4096 | 0.5 | prefix_fill | 0.4823 | 0.4726 | -2.02 | +0.72 |
+| 4096 | 0.9 | prefix_fill | 0.3850 | 0.3805 | -1.17 | -1.88 |
+| 16384 | 0.1 | prefix_fill | 0.3656 | 0.3793 | +3.75 | -2.11 |
+| 16384 | 0.5 | prefix_fill | 0.4920 | 0.4396 | -10.65 | -10.61 |
+| 16384 | 0.9 | prefix_fill | 0.3630 | 0.3706 | +2.09 | +4.95 |
+| 65536 | 0.1 | prefix_fill | 0.3285 | 0.3270 | -0.47 | -0.74 |
+| 65536 | 0.5 | prefix_fill | 0.4119 | 0.4118 | -0.03 | -1.23 |
+| 65536 | 0.9 | prefix_fill | 0.3239 | 0.3249 | +0.28 | +0.22 |
+| 262144 | 0.1 | prefix_fill | 0.3416 | 0.3415 | -0.04 | +0.53 |
+| 262144 | 0.5 | prefix_fill | 0.4238 | 0.4183 | -1.30 | +0.20 |
+| 262144 | 0.9 | prefix_fill | 0.3428 | 0.3374 | -1.57 | -0.84 |
+| 1048576 | 0.1 | prefix_fill | 0.3555 | 0.3559 | +0.11 | +6.03 |
+| 1048576 | 0.5 | prefix_fill | 0.4373 | 0.4336 | -0.86 | +0.80 |
+| 1048576 | 0.9 | prefix_fill | 0.3656 | 0.3593 | -1.72 | -1.60 |
+| 4194304 | 0.1 | prefix_fill | 0.3759 | 0.3733 | -0.68 | -0.66 |
+| 4194304 | 0.5 | prefix_fill | 0.4445 | 0.4441 | -0.10 | +1.89 |
+| 4194304 | 0.9 | prefix_fill | 0.3634 | 0.3625 | -0.26 | +1.02 |
 
 #### pair_li
 
 | n | p | routed | raw ns/elem | offset-0 ns/elem | overhead % | control % |
 |---|---|---|---|---|---|---|
-| 64 | 0.1 | boost_block | 2.0813 | 2.0487 | -1.56 | -1.41 |
-| 64 | 0.5 | boost_block | 1.8530 | 1.8521 | -0.05 | -0.43 |
-| 64 | 0.9 | boost_block | 1.5713 | 1.5626 | -0.55 | -0.98 |
-| 256 | 0.1 | boost_block | 1.8048 | 1.7892 | -0.87 | -1.13 |
-| 256 | 0.5 | boost_block | 1.6380 | 1.6546 | +1.02 | -0.13 |
-| 256 | 0.9 | boost_block | 1.8409 | 1.8004 | -2.20 | -1.47 |
-| 1024 | 0.1 | boost_block | 1.1685 | 1.1653 | -0.27 | -0.54 |
-| 1024 | 0.5 | boost_block | 1.1550 | 1.1514 | -0.31 | -0.66 |
-| 1024 | 0.9 | boost_block | 1.0542 | 1.0705 | +1.55 | +1.89 |
-| 4096 | 0.1 | boost_block | 0.8426 | 0.8324 | -1.21 | -3.35 |
-| 4096 | 0.5 | boost_block | 0.8182 | 0.8059 | -1.51 | -1.61 |
-| 4096 | 0.9 | boost_block | 0.7892 | 0.7846 | -0.58 | -0.09 |
-| 16384 | 0.1 | boost_block | 0.7633 | 0.7622 | -0.14 | -0.26 |
-| 16384 | 0.5 | boost_block | 0.6933 | 0.6964 | +0.45 | +0.32 |
-| 16384 | 0.9 | boost_block | 0.7012 | 0.7073 | +0.87 | -2.24 |
-| 65536 | 0.1 | boost_block | 0.4726 | 0.4742 | +0.33 | +0.49 |
-| 65536 | 0.5 | boost_block | 0.5934 | 0.5872 | -1.04 | -0.88 |
-| 65536 | 0.9 | boost_block | 0.4882 | 0.4847 | -0.71 | -1.31 |
-| 262144 | 0.1 | boost_block | 0.4855 | 0.4872 | +0.34 | +1.11 |
-| 262144 | 0.5 | boost_block | 0.5789 | 0.5824 | +0.61 | +0.58 |
-| 262144 | 0.9 | boost_block | 0.4914 | 0.4907 | -0.13 | -0.03 |
-| 1048576 | 0.1 | boost_block | 0.6636 | 0.6635 | -0.02 | -0.89 |
-| 1048576 | 0.5 | boost_block | 0.6331 | 0.6402 | +1.14 | +0.19 |
-| 1048576 | 0.9 | boost_block | 0.6515 | 0.6414 | -1.55 | -0.22 |
-| 4194304 | 0.1 | boost_block | 0.6813 | 0.6837 | +0.35 | +0.43 |
-| 4194304 | 0.5 | boost_block | 0.6729 | 0.6795 | +0.99 | +1.25 |
-| 4194304 | 0.9 | boost_block | 0.6858 | 0.6888 | +0.43 | -0.56 |
+| 64 | 0.1 | prefix_fill | 2.0845 | 2.0840 | -0.02 | -0.42 |
+| 64 | 0.5 | prefix_fill | 1.8572 | 1.8659 | +0.47 | +0.14 |
+| 64 | 0.9 | prefix_fill | 1.5725 | 1.5689 | -0.22 | -1.23 |
+| 256 | 0.1 | prefix_fill | 1.7873 | 1.7695 | -0.99 | -0.26 |
+| 256 | 0.5 | prefix_fill | 1.6882 | 1.7058 | +1.04 | +0.33 |
+| 256 | 0.9 | prefix_fill | 1.8349 | 1.8325 | -0.13 | -0.10 |
+| 1024 | 0.1 | prefix_fill | 1.2020 | 1.2031 | +0.08 | +0.77 |
+| 1024 | 0.5 | prefix_fill | 1.1621 | 1.1656 | +0.31 | +1.03 |
+| 1024 | 0.9 | prefix_fill | 1.0756 | 1.0877 | +1.13 | +1.10 |
+| 4096 | 0.1 | prefix_fill | 0.8505 | 0.8424 | -0.96 | -1.31 |
+| 4096 | 0.5 | prefix_fill | 0.8208 | 0.8222 | +0.18 | -0.94 |
+| 4096 | 0.9 | prefix_fill | 0.8139 | 0.8060 | -0.96 | +0.05 |
+| 16384 | 0.1 | prefix_fill | 0.7773 | 0.7802 | +0.38 | -1.50 |
+| 16384 | 0.5 | prefix_fill | 0.7085 | 0.7123 | +0.54 | +0.39 |
+| 16384 | 0.9 | prefix_fill | 0.7239 | 0.7266 | +0.37 | -0.50 |
+| 65536 | 0.1 | prefix_fill | 0.4778 | 0.4748 | -0.63 | +0.90 |
+| 65536 | 0.5 | prefix_fill | 0.5926 | 0.5910 | -0.26 | -0.43 |
+| 65536 | 0.9 | prefix_fill | 0.4819 | 0.4914 | +1.98 | +1.74 |
+| 262144 | 0.1 | prefix_fill | 0.5640 | 0.5513 | -2.26 | -4.52 |
+| 262144 | 0.5 | prefix_fill | 0.5857 | 0.6030 | +2.96 | +4.45 |
+| 262144 | 0.9 | prefix_fill | 0.5598 | 0.5016 | -10.40 | -12.78 |
+| 1048576 | 0.1 | prefix_fill | 0.6917 | 0.6956 | +0.56 | -2.20 |
+| 1048576 | 0.5 | prefix_fill | 0.6417 | 0.6592 | +2.72 | +0.31 |
+| 1048576 | 0.9 | prefix_fill | 0.6597 | 0.6720 | +1.87 | +1.59 |
+| 4194304 | 0.1 | prefix_fill | 0.6959 | 0.6845 | -1.64 | -0.63 |
+| 4194304 | 0.5 | prefix_fill | 0.6858 | 0.6802 | -0.82 | +1.15 |
+| 4194304 | 0.9 | prefix_fill | 0.6873 | 0.6858 | -0.22 | -0.90 |

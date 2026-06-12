@@ -511,17 +511,17 @@ struct fused_block_off {
 //     wide moves lose 1.4-1.5x at small f and 2-3x in batched small blocks,
 //     and only ever reach ~5% parity at f>=.5 -- see the byfirst study).
 //
-// ZERO-OFFSET IDENTITY (measured, bench mode `zero`): at offset == 0 this
-// dispatcher takes the raw algo::sized path VERBATIM via an explicit early
-// exit (one perfectly-predicted branch), so the identity holds by
-// construction.  Even without the exit it held semantically (gap_off(0) IS
-// lomuto_branchless; prefix_fill(0) skips phase 1 on its first guard and
-// calls algo::sized -- same branchless_partition instantiation, empty
-// bridge), but the extra inlined wrapper perturbed code layout enough for a
-// reproducible +26% in one tiny batched cell, so the exit ships.  Measured
-// head-to-head vs raw algo::sized (5 types x 9 sizes x 3 p, with a
-// byte-identical control copy to establish the code-placement noise floor):
-// mean overhead ~0%, indistinguishable from the control everywhere.  See
+// ZERO-OFFSET IDENTITY (measured, bench mode `zero`): at offset == 0 the
+// REAL routed algorithms degenerate to the raw partition by construction --
+// gap_off(0) IS lomuto_branchless (identical loop body), and prefix_fill(0)
+// fails its phase-1 guard on the first test and runs algo::sized on the full
+// range (same branchless_partition instantiation, empty bridge) -- and the
+// head-to-head measurement confirms it: vs raw algo::sized over 5 types x 9
+// sizes x 3 key percentiles, overhead is statistically indistinguishable
+// from a byte-identical control copy of the raw kernel (the code-placement
+// noise floor).  There is deliberately NO `offset == 0` early exit calling
+// algo::sized here: it would make that benchmark circular (raw vs raw
+// through a wrapper) and prove nothing about these algorithms.  See
 // docs/offset_partition.md.
 // ---------------------------------------------------------------------------
 struct sized_off {
@@ -532,15 +532,6 @@ struct sized_off {
     I operator()(I first, S last_s, std::iter_difference_t<I> offset, K key,
                  Comp comp, Proj proj) const {
         I last = first + (last_s - first);
-        // offset == 0 IS the ordinary partition: take the raw path verbatim.
-        // One perfectly-predicted branch buys the zero-offset identity BY
-        // CONSTRUCTION -- without it the identity still holds semantically
-        // (prefix_fill(0) falls through to algo::sized), but the extra
-        // inlined wrapper shifted code layout enough to cost a reproducible
-        // +26% in one batched small cell (pair64f n=64 p=.1) and +6-9% in a
-        // few gap-routed ones; with the early exit raw and offset-0 codegen
-        // are the same by definition (bench_offset_partition `zero`).
-        if (offset == 0) return algo::sized{}(first, last, key, comp, proj);
         const auto suffix = (last - first) - offset;
         if (suffix <= algo::detail::sized_cutoff<std::iter_value_t<I>>)
             return gap_off{}(first, last, offset, key, comp, proj);

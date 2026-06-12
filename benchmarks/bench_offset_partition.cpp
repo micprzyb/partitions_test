@@ -277,8 +277,7 @@ inline std::pair<std::vector<pair64>, i64> make_byfirst(std::size_t n, double f,
 // ---------------------------------------------------------------------------
 
 // The two zero-mode kernels are NOINLINE: inlined into the timing lambdas,
-// each side gets its own copy of the (now identical, given sized_off's
-// offset==0 early exit) partition code at a different address, and loop
+// each side gets its own copy of the partition code at a different address, and loop
 // alignment / uop-cache luck then produces +-10-27% per-cell scatter IN BOTH
 // DIRECTIONS -- visible as off0 "beating" raw, which is impossible for real
 // overhead.  Function-aligned out-of-line copies cut that variance; the
@@ -397,13 +396,16 @@ void run_zero(const char* tn, Proj proj, std::size_t max_size) {
             raw = std::min(raw, time_one(raw_fn));
             off0 = std::min(off0, time_one(off0_fn));
             raw2 = std::min(raw2, time_one(raw2_fn));
-            // What algo::sized itself runs at this size (both sides take the
-            // same path: sized_off's offset==0 early exit IS algo::sized).
+            // The REAL variant sized_off routes to at offset 0 for this
+            // (T, n): gap_off below the size cutoff, prefix_fill above.
+            // There is no offset==0 special case in the dispatcher -- the
+            // whole point is to measure the genuine offset algorithms
+            // against the raw partition.
             const char* routed =
                 static_cast<std::ptrdiff_t>(n) <=
                         algo::detail::sized_cutoff<T>
-                    ? "lomuto_branchless"
-                    : "boost_block";
+                    ? "gap_off"
+                    : "prefix_fill";
             std::printf("%s,%zu,%.2f,%s,%.4f,%.4f,%+.2f,%+.2f\n", tn, n, p,
                         routed, raw, off0, (off0 / raw - 1.0) * 100.0,
                         (raw2 / raw - 1.0) * 100.0);
