@@ -81,6 +81,45 @@ pair64-by-first (16-byte element, 8-byte key) tracks the pair64 shape with
 slightly lower absolute numbers (e.g. f=.5 p=.5: prefix_fill 1.04, gap 1.06,
 part_swap 1.46).
 
+### Pair of i64 compared by first coordinate — the primary case (mode `byfirst`)
+
+This is the most important production shape, so it gets a dedicated study
+(`bench_offset_partition byfirst`; it also runs **first** in the default
+mode). Three variants per (n, f, p) cell, same data geometry:
+
+* `p64f_proj` — projection formulation: `proj = first_key`, 8-byte key;
+* `p64f_comp` — comparator formulation: `comp` reads `.first` only, the key
+  is a full 16-byte `pair64` **passed by value**;
+* `p64f_dup256` — projection formulation on low-cardinality firsts
+  (256 distinct values, heavy ties).
+
+**Findings:**
+
+1. **The two formulations are interchangeable.** Over all 27 cells × 7
+   algorithms, comp/proj time ratio: mean 1.004, median 1.002 (extremes
+   ±13% are single-cell noise). The disassembly explains why: GCC keeps only
+   the *live* 8-byte half of the by-value pair pivot, hoisted into a register
+   (`cmp %rbx, -0x10(%rdx); setl; add` in the fill loop) — the `.second`
+   half of the key is dead-code-eliminated. The by-value pivot rule
+   (concepts.hpp) extends to 16-byte keys at zero cost.
+2. **Low cardinality does not flip any regime.** `p64f_dup256` tracks
+   `p64f_proj` within noise in every cell and the per-cell winners are the
+   same. With a partition's single fixed key, the below-test outcome is
+   ~Bernoulli(p) per element whether firsts are unique or drawn from 256
+   values — ties change *which* elements are below, not the predictability
+   of the branch. (The boost_block low-cardinality caveat needs equal keys
+   *adjacent in scan order*, e.g. all-equal blocks, not just duplicates.)
+3. **Winner structure for by-first pairs** matches pair64-lex: `prefix_fill`
+   at p=.1 and at f=.1 (0.70–0.80 vs gap 0.85–1.13 at 2^22), `gap_off`
+   closing to ~5% parity (occasionally ahead: f=.9 p=.9 2^22: 1.10 vs 1.19)
+   once the prefix dominates at large n. The dispatcher's 16-byte routing
+   (always `prefix_fill` above the cutoff) gives up at most ~5% in those
+   cells and gains 1.4–1.5x at small f — the right p-blind trade.
+4. **Correction recorded:** the "gap_off is 4–6 ns on 16-byte types" figure
+   from the batched-small study is a small-block effect; at large single-call
+   sizes by-first gap_off runs 0.7–1.2 ns/suf-elem. The dispatcher rationale
+   in the header was updated accordingly.
+
 ### Batched small blocks (f = 0.5, pool 2^20)
 
 i64: the dispatcher's `gap_off` routing wins nearly every cell up to suffix
@@ -133,6 +172,53 @@ Measured over the full 81-cell sweep, mean regret vs the per-cell oracle is
 ~5%; the worst structural cells are ~15% (i64 f>=.5 p=.1, where the
 narrow-type rule picks gap over prefix_fill, and the predictable-branch
 scan_swap cells it deliberately ignores).
+
+## Zero-offset identity (mode `zero`)
+
+`offset == 0` is, by contract, the ordinary forward partition — so the
+dispatcher must cost the same as raw `algo::sized` there, or the offset
+machinery has hidden overhead. Mode `zero` times every variant at f = 0
+against `whole` (= raw `algo::sized`, offset ignored) on identical data:
+3 types × {64…4096 batched, 2^16…2^22 single} × p ∈ {.1,.5,.9}.
+
+**Result: the identity holds.** Over all 63 cells, `sized_off`/raw ratio:
+mean **1.0015**, median 1.0012, σ 2.3%, extremes 0.93–1.07 *in both
+directions* (paired noise, not a one-sided tax). `prefix_fill` alone at
+offset 0, n ≥ 2^16: ratio 0.998 — statistically identical. Batched tiny
+blocks: mean 1.011, a ~1% residual at the edge of noise.
+
+**Why it holds, by construction (verified in the disassembly):**
+
+* Large path: at offset 0, `sized_off` → `prefix_fill` (the narrow-type rule
+  `offset >= suffix` is false); phase 1's guard `pfx_end - lo >= 128` fails
+  on the first test, and phase 2 calls `algo::sized` on the full range. Both
+  routes bottom out in the **same out-of-line `branchless_partition`
+  instantiation** (one symbol in the probe object, called from both).
+* The phase-2 bridge degenerates safely: slots = 0 forces the
+  `swap_ranges(lo, pfx_end, …)` arm with an **empty** range — no spurious
+  self-swap (the `c_rem <= slots` arm would have been
+  `swap_ranges(first, first+c, first)`, a real in-place swap pass; the
+  branch order avoids it for every `c_rem > 0`).
+* Small path: `gap_off(offset=0)` is literally `lomuto_branchless` — same
+  11-instruction branchless body (`2 moves; cmp; setg; add`); the only
+  difference is scheduling (raw's loop software-pipelines the next `v[i]`
+  load, gap reloads at the loop top; measured parity, see the gap_off
+  columns at n ≤ 512).
+
+**One asymmetry found in standalone codegen (compare assemblers):** compiled
+as an out-of-line function, `sized_off` pays `prefix_fill`'s *hoisted* frame
+before any dispatch check runs — 64-byte stack realignment, six register
+pushes, a 0x140-byte frame for the offset buffer, and a stack-protector
+canary (`mov %fs:0x28`) — while raw `algo::sized`'s small path runs
+frameless (GCC keeps `branchless_partition` out of line there, so the lean
+path stays lean). This is ~10–15 cycles per call, **not reproduced at real
+(inlined) call sites** — the benchmark shows mean 1.0015 — and would matter
+only for a non-inlinable wrapper called at high rate on tiny arrays.
+Splitting `prefix_fill` behind `[[gnu::noinline]]` to fix the standalone
+shape was considered and **not adopted**: it trades an unconditional call
+into the hot large-n path for a cost the measurements cannot see (negative
+result, recorded). For the same reason no `offset == 0` early-exit branch
+was added to the dispatcher — there is nothing to win.
 
 ## Assembly notes (GCC 15.2, `-O3 -march=native`, objdump of noinline probes)
 

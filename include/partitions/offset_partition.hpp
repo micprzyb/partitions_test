@@ -66,8 +66,10 @@
 //     the high-p cells (i64 2^22 f=.9 p=.9: 0.61 vs prefix_fill 0.79) and,
 //     averaged over p, narrow-type cells with a dominating prefix -- hence
 //     the dispatcher's narrow-type offset >= suffix rule.  For 16-byte
-//     elements its two wide moves per element are never competitive (4-6
-//     ns/suf-elem on pair64).
+//     elements it is the worse default: 1.4-1.5x slower at f=.1 large n
+//     (1.07 vs 0.75, pair64-by-first 2^22 p=.5) and 2-3x in batched small
+//     blocks; only at f>=.5 large n does it reach ~5% parity -- not enough
+//     to widen the rule beyond narrow types.
 //   * part_swap ties prefix_fill at low p / low f (its epilogue is
 //     min(c, offset) AVX-vectorised swaps -- bounded by the SMALLER of the
 //     two), and is the piece prefix_fill's phase 2 reuses; standalone it
@@ -506,7 +508,17 @@ struct fused_block_off {
 //     only the p=0.1 cell, 0.52 vs 0.45, and wins p>=0.5 by 10-25%).  p is
 //     unknowable at call time, so this is an expected-cost choice;
 //   * everything else: prefix_fill (for 16-byte elements gap_off's double
-//     16-byte moves are 4-6 ns/elem -- never competitive above the cutoff).
+//     wide moves lose 1.4-1.5x at small f and 2-3x in batched small blocks,
+//     and only ever reach ~5% parity at f>=.5 -- see the byfirst study).
+//
+// ZERO-OFFSET IDENTITY (measured, bench mode `zero`): at offset == 0 this
+// dispatcher costs the same as raw algo::sized -- ratio mean 1.0015 over 63
+// cells -- because every route degenerates structurally: gap_off(0) IS
+// lomuto_branchless, and prefix_fill(0) skips phase 1 on its first guard and
+// calls algo::sized on the full range (both bottom out in the same
+// branchless_partition instantiation; the phase-2 bridge is an empty
+// swap_ranges).  An explicit offset==0 early exit was measured to win
+// nothing and is deliberately absent.  See docs/offset_partition.md.
 // ---------------------------------------------------------------------------
 struct sized_off {
     static constexpr const char* name = "sized_off";
