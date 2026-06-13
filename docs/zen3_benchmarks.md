@@ -182,30 +182,25 @@ keys**.
 
 ## 3. Suggested improvements
 
-1. **Microarchitecture-tune the `sized` dispatcher for Zen 3 (validated, ~6–20 %
-   on i64 mid-range).** For an 8-byte cheap-compare key, add a `fulcrum` tier
-   between the small-n `lomuto_branchless` and the huge-n `boost_block`:
+> **Update — done.** The best lever turned out to be neither the dispatcher nor
+> the block size but **vectorising the offset-fill loop**. A new partition
+> `algo::block_simd_amd` (AVX2 fill, scalar fallback for every non-i64 / reverse
+> form) is now the fastest i64 partition on Zen 3 from n=1024–2²² (e.g. 4096:
+> 0.378 vs boost 0.450, even beating the doc's Meteor-Lake boost 0.36). Full
+> root-cause + design + results: **`docs/zen3_amd_block_partition.md`**. The
+> shipped `boost_block`/`fulcrum`/`sized` are untouched. The original
+> suggestions are kept below for the record.
 
-   ```
-   sizeof(T) <= 8 :  n <= ~128         -> lomuto_branchless
-                     ~128 < n <= ~2^21 -> fulcrum        (Zen 3: the new win)
-                     n  >  ~2^21        -> boost_block   (array > L3)
-   sizeof(T)  > 8 :  unchanged (boost_block from n=24; fulcrum never wins lex)
-   ```
+1. ~~**Add a `fulcrum` mid-tier to `sized` for Zen 3** (~6–20 % on i64
+   mid-range).~~ Superseded: `block_simd_amd` beats *both* boost and fulcrum on
+   i64, so the better dispatcher tune is to route 8-byte cheap-compare mid/large
+   blocks to `block_simd_amd`. Not wired into `sized` yet (dispatch unification
+   deferred by request); the standalone partitioner is in the registry.
 
-   This is a *per-µarch* policy: on Meteor Lake `boost_block` should keep the
-   mid-range. The cleanest implementation is to make `detail::sized_cutoff` and
-   the mid-tier choice depend on a `PARTITIONS_UARCH` switch (default = current
-   Meteor-Lake-tuned behaviour) so the header stays portable. The current code
-   is *not wrong* — it is tuned for the chip it was measured on; this just adds a
-   second tuning point. I did **not** apply it, since it changes shipped
-   dispatch and should be gated behind a build flag and re-confirmed per target.
-
-2. **Re-tune `boost_block_size` (currently 128) on Zen 3.** The comment at
-   `algorithms.hpp:341` notes 128 was a ~17 % win over pdqsort's 64 *on Meteor
-   Lake*. Given the offset-fill loop is the Zen 3 bottleneck, the block size that
-   best amortises the recurrence may differ here. A quick sweep of {64, 96, 128,
-   192} is cheap and may recover part of the 22 %. (Out of scope to apply blind.)
+2. ~~**Re-tune `boost_block_size` (128) on Zen 3.**~~ Measured and **rejected**:
+   sweeping {64,96,128,192} moves i64 throughput ≤ 10 % and never closes the gap
+   to fulcrum — the scalar two-pass structure is the ceiling, not the block size
+   (table in `docs/zen3_amd_block_partition.md` §2). 128 stays.
 
 3. **Soften the doc's absolute claim.** `algorithms.hpp:296` and the
    `boost_block` header call it "the fastest partitioner here". That is

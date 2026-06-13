@@ -19,6 +19,22 @@ single core pinned; `random_uniform`; min-time over batched blocks; large-n
 numbers are the median of 3 runs. Reproduce with
 `build/benchmarks/bench_partition_efficiency`.
 
+**Strategy naming (this doc ↔ CSV `strategy` column).** A strategy is
+`<pivot>` + `<partition>`. The tables below abbreviate to the pivot name where
+the partition is fixed; the CSV always spells out both, so diff against it with
+this map:
+
+| doc (short) | CSV `strategy` | = pivot + partition |
+|---|---|---|
+| `m3_boost`   | `m3_boost`        | median_of_3 + boost_block |
+| `ninther`    | `ninther_boost`   | ninther + boost_block |
+| `m5m5`       | `m5m5_boost`      | median_of_5_medians_of_5 + boost_block |
+| `mom`        | `mom_boost`       | median_of_medians_5 + boost_block |
+| `pseudo9`    | `pseudo9_boost`   | pseudo9 (value pivot) + boost_block |
+| `nin_lomuto` | `ninther_lomuto`  | ninther + branchless Lomuto |
+| `m3m3swap`   | `m3m3swap_boost`  | m3m3 *exchange* pivot + boost_block |
+| `sort_mid`   | `sort_mid`        | small_sort network, split at middle |
+
 ## Why this metric
 
 `E` rewards **both speed and balance simultaneously**. A perfectly balanced
