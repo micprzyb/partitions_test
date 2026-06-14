@@ -21,8 +21,12 @@ cd "$(dirname "$0")/.."
 CXX=${CXX:-g++}
 JOBS=${JOBS:-30}
 CORE0=${CORE0:-2}
-WAVE_RESTARTS=${WAVE_RESTARTS:-8}
-WAVE_ITERS=${WAVE_ITERS:-1500}
+# Shorter waves => the improving bound (best floor) propagates across all parallel
+# jobs sooner: every wave reseeds from the current frontier, so more frequent
+# waves = more frequent global sync.  Kept large enough that each job's ILS still
+# makes progress from a frontier seed.
+WAVE_RESTARTS=${WAVE_RESTARTS:-4}
+WAVE_ITERS=${WAVE_ITERS:-1000}
 FRONTIER_CAP=${FRONTIER_CAP:-40}
 TOTAL_HOURS=${TOTAL_HOURS:-120}
 STATE=${STATE:-optimizers/campaign_state}

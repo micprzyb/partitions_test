@@ -50,8 +50,14 @@ def main():
     bp = Path(f"/tmp/seeds_base_{n}.txt")
     if bp.exists():
         base = [l.strip() for l in bp.read_text().splitlines() if l.strip()]
+    # Once the floor beats every base seed, restarting from the (larger, stale)
+    # base just wastes work re-deriving back down -- seed purely from the improved
+    # frontier (the better bound).  Keep base only while it can still help.
+    base_min = min((len(re.findall(r'\{\d+,\d+\}', b)) for b in base), default=10**9)
+    if floor < base_min:
+        base = []
     rng = random.Random()
-    sample = floornets[:] ; rng.shuffle(sample); sample = sample[:cap]
+    sample = floornets[:]; rng.shuffle(sample); sample = sample[:cap]
     Path(f"/tmp/seeds_{n}.txt").write_text("\n".join(base + sample) + "\n")
     print(f"floor={floor} floornets={len(floornets)} distinct={len(seen)}")
 
