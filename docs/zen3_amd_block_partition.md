@@ -134,17 +134,16 @@ reverse form, `block_simd_amd` falls back to the scalar block and tracks
 ## 5. Status and next step
 
 `block_simd_amd` is a standalone `PivotPartitioner` (with the position-aware
-`at`) registered alongside the others — *not* yet wired into the `sized`
-dispatcher (per the request to keep dispatch decisions for later). The obvious
-follow-up, once a unified policy is wanted, is: on Zen 3, route the
-8-byte-cheap-compare mid/large range to `block_simd_amd` instead of
-`boost_block`. Further headroom not yet taken:
+`at`) registered alongside the others. **The three follow-ups below are now
+done — see `docs/zen3_quick_partition.md`:**
 
-* **i32 (8-wide)** — the same trick with `vpcmpgtq`/`movemask_ps` and a 256-entry
-  LUT processes 8 elements per vector; i32 is the narrowest cheap type and should
-  gain the most. Currently i32 falls back to scalar (the fast path is gated to
-  `sizeof==8`).
-* **Vectorising the swap/compaction**, not just the predicate fill — the second
-  pass is now the larger share of the remaining time.
-* **AVX-512** would collapse the fill to a single masked `vpcompress` per 8
-  elements, but neither this Zen 3 nor Meteor Lake has it.
+* **i32 (8-wide)** — ✅ added (`vpcmpgtd`/`movmskps`, 256-entry LUT, 8 elem/vec);
+  ~2–3× boost_block for i32.
+* **Vectorising the swap/compaction** — ✅ `block_compress_amd`, a single-pass
+  `vpermd`-LUT compaction with no separate swap pass; fastest small/mid (it wins
+  while the block is L2-resident, then `block_simd_amd` takes over).
+* **A unified dispatcher** — ✅ `quick_partition` routes by size/width/key/ISA
+  (lomuto → compaction while L2-resident → fill+swap; wide/lex → `sized`),
+  1.4–2.1× the old `sized` for i64 and 1.7–3.3× for i32.
+* **AVX-512** (still future) would collapse the compaction to a single masked
+  `vpcompressd` per 8 elements; neither this Zen 3 nor Meteor Lake has it.

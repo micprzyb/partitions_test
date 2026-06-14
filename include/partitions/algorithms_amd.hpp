@@ -83,34 +83,75 @@ inline constexpr Lut4 make_lut4() {
 }
 inline constexpr Lut4 kLut4 = make_lut4();
 
-// Is the (type, comparator, projection) the i64-shaped fast path?  Then
-// below(x) == (x < pivot) on a contiguous block of an 8-byte signed integer.
+// 256-entry equivalent for 8-lane (i32) fills.  pos/roff pack up to 8 bytes.
+struct Lut8 {
+    std::uint64_t pos[256];
+    std::uint64_t roff[256];
+    std::uint8_t cnt[256];
+};
+inline constexpr Lut8 make_lut8() {
+    Lut8 t{};
+    for (int m = 0; m < 256; ++m) {
+        std::uint64_t pos = 0, roff = 0;
+        int k = 0;
+        for (int b = 0; b < 8; ++b)
+            if (m & (1 << b)) pos |= std::uint64_t(b) << (8 * k++);
+        int j = 0;
+        for (int b = 7; b >= 0; --b)  // descending lane -> ascending offset 1..8
+            if (m & (1 << b)) roff |= std::uint64_t(8 - b) << (8 * j++);
+        t.cnt[m] = static_cast<std::uint8_t>(k);
+        t.pos[m] = pos;
+        t.roff[m] = roff;
+    }
+    return t;
+}
+inline constexpr Lut8 kLut8 = make_lut8();
+
+// Is the (type, comparator, projection) a SIMD fast path?  Then
+// below(x) == (x < pivot) on a contiguous block of a 4- or 8-byte signed int.
 template <class T, class Comp, class Proj>
 inline constexpr bool simd_eligible =
     std::is_same_v<Proj, std::identity> &&
     (std::is_same_v<Comp, std::less<>> || std::is_same_v<Comp, std::less<T>>) &&
-    std::is_integral_v<T> && std::is_signed_v<T> && sizeof(T) == 8;
+    std::is_integral_v<T> && std::is_signed_v<T> &&
+    (sizeof(T) == 8 || sizeof(T) == 4);
 
 #if defined(__AVX2__)
 // Append, to offsets_l[num_l..], the local indices in [0,BS) of elements that
 // are NOT below the pivot (>= pivot -> belong right).  base points at the block.
+// 4-wide for 8-byte keys (vpcmpgtq + movmskpd, 16-entry LUT, 4-byte store);
+// 8-wide for 4-byte keys (vpcmpgtd + movmskps, 256-entry LUT, 8-byte store).
 template <class T>
 [[gnu::always_inline]] inline void vfill_left(const T* base, T pivot,
                                               unsigned char* offl,
                                               std::size_t& num_l,
                                               std::size_t BS) {
-    const __m256i vp = _mm256_set1_epi64x(static_cast<long long>(pivot));
-    for (std::size_t i = 0; i < BS; i += 4) {
-        __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(base + i));
-        // below = x < pivot  <=>  pivot > x  <=>  cmpgt(vp, x)
-        __m256i lt = _mm256_cmpgt_epi64(vp, x);
-        unsigned bm =
-            static_cast<unsigned>(_mm256_movemask_pd(_mm256_castsi256_pd(lt)));
-        unsigned ge = (~bm) & 0xF;  // !below -> goes right
-        std::uint32_t packed =
-            kLut4.pos[ge] + static_cast<std::uint32_t>(i) * 0x01010101u;
-        std::memcpy(offl + num_l, &packed, 4);  // unconditional 4-byte store
-        num_l += kLut4.cnt[ge];                  // advance by popcount only
+    if constexpr (sizeof(T) == 8) {
+        const __m256i vp = _mm256_set1_epi64x(static_cast<long long>(pivot));
+        for (std::size_t i = 0; i < BS; i += 4) {
+            __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(base + i));
+            __m256i lt = _mm256_cmpgt_epi64(vp, x);  // x < pivot
+            unsigned bm = static_cast<unsigned>(
+                _mm256_movemask_pd(_mm256_castsi256_pd(lt)));
+            unsigned ge = (~bm) & 0xF;  // !below
+            std::uint32_t packed =
+                kLut4.pos[ge] + static_cast<std::uint32_t>(i) * 0x01010101u;
+            std::memcpy(offl + num_l, &packed, 4);
+            num_l += kLut4.cnt[ge];
+        }
+    } else {  // sizeof(T) == 4
+        const __m256i vp = _mm256_set1_epi32(static_cast<int>(pivot));
+        for (std::size_t i = 0; i < BS; i += 8) {
+            __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(base + i));
+            __m256i lt = _mm256_cmpgt_epi32(vp, x);  // x < pivot
+            unsigned bm = static_cast<unsigned>(
+                _mm256_movemask_ps(_mm256_castsi256_ps(lt)));
+            unsigned ge = (~bm) & 0xFF;
+            std::uint64_t packed =
+                kLut8.pos[ge] + static_cast<std::uint64_t>(i) * 0x0101010101010101ull;
+            std::memcpy(offl + num_l, &packed, 8);
+            num_l += kLut8.cnt[ge];
+        }
     }
 }
 
@@ -122,20 +163,138 @@ template <class T>
                                                unsigned char* offr,
                                                std::size_t& num_r,
                                                std::size_t BS) {
-    const __m256i vp = _mm256_set1_epi64x(static_cast<long long>(pivot));
-    for (std::size_t g = 0; g < BS; g += 4) {
-        // group examines [rlast-g-4 .. rlast-g-1]; lane b at rlast-g-4+b has
-        // offset-from-rlast = g + (4 - b)  -> roff lane value (4-b), base g.
-        const T* p = rlast - g - 4;
-        __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-        __m256i lt = _mm256_cmpgt_epi64(vp, x);  // below = x < pivot
-        unsigned bm =
-            static_cast<unsigned>(_mm256_movemask_pd(_mm256_castsi256_pd(lt)));
-        std::uint32_t packed =
-            kLut4.roff[bm] + static_cast<std::uint32_t>(g) * 0x01010101u;
-        std::memcpy(offr + num_r, &packed, 4);
-        num_r += kLut4.cnt[bm];
+    if constexpr (sizeof(T) == 8) {
+        const __m256i vp = _mm256_set1_epi64x(static_cast<long long>(pivot));
+        for (std::size_t g = 0; g < BS; g += 4) {
+            const T* p = rlast - g - 4;  // lane b -> offset g+(4-b)
+            __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+            __m256i lt = _mm256_cmpgt_epi64(vp, x);
+            unsigned bm = static_cast<unsigned>(
+                _mm256_movemask_pd(_mm256_castsi256_pd(lt)));
+            std::uint32_t packed =
+                kLut4.roff[bm] + static_cast<std::uint32_t>(g) * 0x01010101u;
+            std::memcpy(offr + num_r, &packed, 4);
+            num_r += kLut4.cnt[bm];
+        }
+    } else {  // sizeof(T) == 4
+        const __m256i vp = _mm256_set1_epi32(static_cast<int>(pivot));
+        for (std::size_t g = 0; g < BS; g += 8) {
+            const T* p = rlast - g - 8;  // lane b -> offset g+(8-b)
+            __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+            __m256i lt = _mm256_cmpgt_epi32(vp, x);
+            unsigned bm = static_cast<unsigned>(
+                _mm256_movemask_ps(_mm256_castsi256_ps(lt)));
+            std::uint64_t packed =
+                kLut8.roff[bm] + static_cast<std::uint64_t>(g) * 0x0101010101010101ull;
+            std::memcpy(offr + num_r, &packed, 8);
+            num_r += kLut8.cnt[bm];
+        }
     }
+}
+
+// ---- compaction (single-pass, swap-free) partition --------------------------
+// vpermd compaction control LUTs.  For a lane mask, output lane `dst` reads input
+// lane `src`: the set ("< pivot") lanes are gathered to the front, the clear
+// (">= pivot") lanes to the back.  i32: 256 entries on 8 lanes.  i64: 16 entries
+// on 4 lanes, expressed as int32 pairs so the one vpermd permutes 64-bit lanes.
+struct PermLut32 { alignas(32) std::int32_t v[256][8]; };
+struct PermLut64 { alignas(32) std::int32_t v[16][8]; };
+inline constexpr PermLut32 make_perm32() {
+    PermLut32 t{};
+    for (int m = 0; m < 256; ++m) {
+        int nl = 0;
+        for (int i = 0; i < 8; ++i) nl += (m >> i) & 1;
+        int l = 0, r = nl;
+        for (int i = 0; i < 8; ++i) {
+            int dst = ((m >> i) & 1) ? l++ : r++;
+            t.v[m][dst] = i;
+        }
+    }
+    return t;
+}
+inline constexpr PermLut64 make_perm64() {
+    PermLut64 t{};
+    for (int m = 0; m < 16; ++m) {
+        int nl = 0;
+        for (int i = 0; i < 4; ++i) nl += (m >> i) & 1;
+        int l = 0, r = nl;
+        for (int i = 0; i < 4; ++i) {
+            int dst = ((m >> i) & 1) ? l++ : r++;
+            t.v[m][2 * dst] = 2 * i;
+            t.v[m][2 * dst + 1] = 2 * i + 1;
+        }
+    }
+    return t;
+}
+inline constexpr PermLut32 kPerm32 = make_perm32();
+inline constexpr PermLut64 kPerm64 = make_perm64();
+
+// Partition [a, a+n) around `pivot` (a[0..m) < pivot <= a[m..n)) in ONE pass:
+// read full vectors from both ends inward, compact each (< lanes to the front),
+// and DOUBLE-STORE the compacted vector at the left write cursor and the right
+// write cursor -- advancing left by popcount and right by the complement, so the
+// overwritten halves are reclaimed as the cursors converge (the vectorised
+// analogue of the fulcrum double write, with no offset buffer and no swap pass).
+// The two end vectors are preloaded so their slots are free; the < W middle
+// remainder + the two buffered vectors are finished by a tiny scalar tail.
+// Reads are kept ahead of writes by always refilling the side with less slack
+// (each end starts with W slots of slack from the preload).  Requires n >= 2*W.
+template <class T>
+inline std::size_t compress_partition(T* a, std::size_t n, T pivot) {
+    constexpr std::size_t W = 32 / sizeof(T);
+    const __m256i vp = sizeof(T) == 8
+                           ? _mm256_set1_epi64x(static_cast<long long>(pivot))
+                           : _mm256_set1_epi32(static_cast<int>(pivot));
+    std::size_t i = W, j = n - W, sl = 0, sr = n;
+    __m256i vL = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a));
+    __m256i vR = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + n - W));
+
+    auto cstore = [&](__m256i x) {
+        unsigned mask;
+        if constexpr (sizeof(T) == 8) {
+            mask = static_cast<unsigned>(_mm256_movemask_pd(
+                _mm256_castsi256_pd(_mm256_cmpgt_epi64(vp, x))));
+            x = _mm256_permutevar8x32_epi32(
+                x, _mm256_load_si256(reinterpret_cast<const __m256i*>(kPerm64.v[mask])));
+        } else {
+            mask = static_cast<unsigned>(_mm256_movemask_ps(
+                _mm256_castsi256_ps(_mm256_cmpgt_epi32(vp, x))));
+            x = _mm256_permutevar8x32_epi32(
+                x, _mm256_load_si256(reinterpret_cast<const __m256i*>(kPerm32.v[mask])));
+        }
+        int nl = __builtin_popcount(mask);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(a + sl), x);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(a + sr - W), x);
+        sl += static_cast<std::size_t>(nl);
+        sr -= (W - static_cast<std::size_t>(nl));
+    };
+
+    while (j - i >= W) {
+        __m256i v;
+        if ((i - sl) <= (sr - j)) {
+            v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
+            i += W;
+        } else {
+            j -= W;
+            v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + j));
+        }
+        cstore(v);
+    }
+
+    // scalar tail: the two preloaded vectors + the < W middle remainder.
+    T tmp[3 * W];
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(tmp), vL);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(tmp + W), vR);
+    std::size_t cnt = 2 * W;
+    for (std::size_t k = i; k < j; ++k) tmp[cnt++] = a[k];
+    for (std::size_t k = 0; k < cnt; ++k) {
+        T x = tmp[k];
+        if (x < pivot)
+            a[sl++] = x;
+        else
+            a[--sr] = x;
+    }
+    return sl;  // sl == sr == m
 }
 #endif  // __AVX2__
 
@@ -321,6 +480,43 @@ struct block_simd_amd {
             return hoare{}(first, last, key, comp, proj);
         return detail_amd::branchless_partition_amd<false, true, BS>(
             first, last, key, comp, proj);
+    }
+};
+
+// Single-pass AVX2 compaction partition (no offset buffer, no swap pass) for the
+// i32/i64 fast path; everything else falls back to boost_block.  The vectorised
+// "swap" is the compaction itself: each loaded vector is compacted and committed
+// to both ends in one pass.
+struct block_compress_amd {
+    static constexpr const char* name = "block_compress_amd";
+    static constexpr std::ptrdiff_t cutoff = 64;  // < cutoff -> boost_block
+
+    template <std::random_access_iterator I, std::sentinel_for<I> S, class K,
+              class Comp, class Proj>
+    I operator()(I first, S last, K pivot, Comp comp, Proj proj) const {
+        I end = first + (last - first);
+        const auto n = end - first;
+#if defined(__AVX2__)
+        using T = std::iter_value_t<I>;
+        if constexpr (std::contiguous_iterator<I> &&
+                      detail_amd::simd_eligible<T, Comp, Proj>) {
+            if (n >= cutoff)
+                return first + static_cast<std::iter_difference_t<I>>(
+                                   detail_amd::compress_partition<T>(
+                                       &*first, static_cast<std::size_t>(n),
+                                       static_cast<T>(pivot)));
+        }
+#endif
+        return boost_block{}(first, end, pivot, comp, proj);
+    }
+
+    // Position form: no sentinel benefit (value-based), just read the key.
+    template <std::random_access_iterator I, std::sentinel_for<I> S,
+              class Comp = std::less<>, class Proj = std::identity>
+    I at(I first, S last_s, I pivot, Comp comp = {}, Proj proj = {}) const {
+        I last = first + (last_s - first);
+        auto key = std::invoke(proj, *pivot);
+        return (*this)(first, last, key, comp, proj);
     }
 };
 

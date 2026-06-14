@@ -14,6 +14,7 @@
 #include "algorithms.hpp"
 #include "algorithms_amd.hpp"
 #include "concepts.hpp"
+#include "quick_partition.hpp"
 #include "distributions.hpp"
 #include "partition_api.hpp"
 #include "partition_with_pivot.hpp"
@@ -37,7 +38,8 @@ inline auto default_partitioners() {
                       algo::lomuto_branchless{}, algo::hoare{},
                       algo::hoare_guarded{},    algo::block{},
                       algo::boost_block{},      algo::fulcrum{},
-                      algo::block_simd_amd{},   algo::sized{}};
+                      algo::block_simd_amd{},   algo::block_compress_amd{},
+                      quick_partition{},        algo::sized{}};
 }
 
 // Pivot-selection strategies.  Most return a POSITION; midpoint_* return a
