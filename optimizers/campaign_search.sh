@@ -25,7 +25,7 @@ WAVE_RESTARTS=${WAVE_RESTARTS:-8}
 WAVE_ITERS=${WAVE_ITERS:-1500}
 FRONTIER_CAP=${FRONTIER_CAP:-40}
 TOTAL_HOURS=${TOTAL_HOURS:-120}
-STATE=optimizers/campaign_state
+STATE=${STATE:-optimizers/campaign_state}
 mkdir -p "$STATE"
 LOG="$STATE/progress.log"
 
@@ -33,11 +33,12 @@ log(){ echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
 
 # Per-n time weights (bigger n -> more time). Sum below scales to TOTAL_HOURS.
 declare -A W=( [24]=40 [23]=28 [22]=20 [21]=14 [20]=8 [19]=6 [18]=4 )
-WSUM=0; for n in "${!W[@]}"; do WSUM=$((WSUM + W[n])); done
+WSUM=0; for n in "${!W[@]}"; do WSUM=$((WSUM + ${W[$n]})); done
 
 log "=== campaign_search start: TOTAL_HOURS=$TOTAL_HOURS JOBS=$JOBS waves=${WAVE_RESTARTS}x${WAVE_ITERS} ==="
 $CXX -O3 -march=native -std=c++23 optimizers/search_halve_cegar.cpp -o /tmp/sh_campaign 2>>"$LOG" \
   || { log "FATAL: build failed"; exit 1; }
+[ -d build ] || cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >>"$LOG" 2>&1
 
 for n in 24 23 22 21 20 19 18; do
   budget_s=$(python3 -c "print(int($TOTAL_HOURS*3600*${W[$n]}/$WSUM))")
@@ -69,6 +70,16 @@ for n in 24 23 22 21 20 19 18; do
   cp "/tmp/seeds_base_$n.txt" "$d/seeds_base.txt" 2>/dev/null || true
   touch "$d/SEARCH_DONE"
   log "n=$n SEARCH_DONE ($(python3 optimizers/merge_reseed.py "$n" "$FRONTIER_CAP" 2>/dev/null))"
+
+  # Finalise THIS n before moving on: benchmark, install the fastest floor net,
+  # verify exhaustively (fwd+rev) + full test suite, document + commit -- or
+  # revert untouched on any failure (the verify gate).  Done here so each n is
+  # added to the repo before the next, and so the campaign needs no live session.
+  if [ "${NO_FINALIZE:-0}" != "1" ]; then
+    log "n=$n finalizing (benchmark + verify + commit)..."
+    python3 optimizers/finalize.py "$n" --commit >>"$LOG" 2>&1 \
+      || log "n=$n finalize returned nonzero (reverted or no-improvement; see log)"
+  fi
 done
 
 touch "$STATE/ALL_DONE"
