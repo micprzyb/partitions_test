@@ -36,6 +36,7 @@ if(PARTITIONS_BUILD_BENCHMARKS)
 endif()
 if(PARTITIONS_BUILD_TOOLS)
     add_subdirectory(tools)
+    add_subdirectory(optimizers)
 endif()
 
 message(STATUS "partitions_test: build=${CMAKE_BUILD_TYPE} "
