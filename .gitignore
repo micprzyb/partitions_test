@@ -26,3 +26,6 @@ compile_commands.json
 
 # Vendored external deps (fetched, not committed)
 /third_party/
+
+# Halver-optimization campaign runtime state (search pools, markers)
+/optimizers/campaign_state/
