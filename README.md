@@ -3,8 +3,12 @@
 [![CI](https://github.com/micprzyb/partitions_test/actions/workflows/ci.yml/badge.svg)](https://github.com/micprzyb/partitions_test/actions/workflows/ci.yml)
 
 A C++23 test bench for **custom, single-threaded partition functions** —
-checking both **correctness** and **performance**, and measuring **pivot
-quality** independently of any partition algorithm.
+checking both **correctness** and **performance**, measuring **pivot quality**
+independently of any partition algorithm — and a study of what can be built
+from partitioning *alone*: pure-partition quicksorts (no insertion-sort leaf),
+reversed partitions at zero extra cost, branchless rank-split networks
+("halvers"), and selection-style routines. Every study is measured; the
+findings live in `docs/`.
 
 A *partition* here reorders a block so that every element strictly smaller than
 a pivot precedes every element greater-than-or-equal to it:
@@ -24,24 +28,34 @@ It is parameterised by a **comparison** and a **projection** (à la
 
 ## The one thing you implement
 
-Every algorithm — and every algorithm *you* want to test — is expressed as a
-single **partition-by-predicate**:
+Every algorithm — and every algorithm *you* want to test — models
+`PivotPartitioner` (`concepts.hpp`): a single **partition-around-a-pivot**
+threading the comparator and projection directly:
 
 ```cpp
 struct my_partition {
     static constexpr const char* name = "my_partition";
 
-    template <std::random_access_iterator I, std::sentinel_for<I> S, class Pred>
-    I operator()(I first, S last, Pred keep_left) const {
-        // reorder [first,last) so keep_left(*x) elements come first;
-        // return the partition point.
+    template <std::random_access_iterator I, std::sentinel_for<I> S,
+              class K, class Comp, class Proj>
+    I operator()(I first, S last, K pivot, Comp comp, Proj proj) const {
+        // reorder [first,last) so elements with comp(proj(x), pivot) come
+        // first; return the partition point.
     }
 };
 ```
 
-From that primitive the library *derives* all four forms above (forward/reverse
-just flip the predicate; key/position just decide how the pivot key is
-obtained). Add your type to `default_partitioners()` in
+The pivot is taken **by value**: a partition permutes the block while comparing
+against the pivot, so a reference pivot forces the compiler to assume aliasing
+and reload it every comparison; by value it stays in a register (verified by
+disassembly). During a partition `comp` is only ever evaluated against the one
+fixed `pivot`, so it acts as a unary predicate `below(x) = comp(proj(x), pivot)`
+— strict-weak ordering matters for pivot *selection* and sorting, not for the
+partition step itself. That is what lets the library *derive* all four forms
+above from this one primitive (reverse just negates the comparator; key/position
+just decide how the pivot key is obtained).
+
+Add your type to `default_partitioners()` in
 `include/partitions/partitions.hpp` and it is automatically covered by:
 
 * the full correctness sweep (every type × distribution × form × size),
@@ -65,32 +79,48 @@ I at(I first, S last, I pivot, Comp comp, Proj proj) const;   // [first,m) < piv
 
 `partition_by_position` dispatches to `at` when present (and reuses it on
 reverse iterators for `reverse_partition_by_position`), otherwise it falls back
-to the predicate path. Key pivots never use `at`, since a key may be absent
-from the block and so cannot serve as a sentinel. `algo::hoare_guarded` is a
-worked example (the guard wins on predictable inputs such as sorted data).
+to the key path. Key pivots never use `at`, since a key may be absent from the
+block and so cannot serve as a sentinel. `algo::hoare_guarded` and
+`algo::boost_block` are worked examples.
 
 ## Repository layout
 
 ```
 include/partitions/      header-only library
-  types.hpp              element types (i32, i64, pair64, keyed) + projections
-  concepts.hpp           PredicatePartitioner — the extension point
+  types.hpp              element types (i32, i64, pair64, pair_fi, pair_di,
+                         pair_li, keyed) + projections
+  concepts.hpp           PivotPartitioner — the extension point
   algorithms.hpp         std_partition, lomuto, lomuto_branchless, hoare,
-                         hoare_guarded (position-aware), block
+                         hoare_guarded, block, boost_block, fulcrum,
+                         sized (size-dispatching)
   partition_api.hpp      forward/reverse × key/position adapters (+ at dispatch)
   partition_with_pivot.hpp  convention-agnostic glue (position OR value pivot)
-  pivot.hpp              position pivots: first/middle/last, median_of_{3,5},
-                         ninther, median_of_5_medians_of_5, median_of_medians_5,
-                         random; value pivots (may be absent): pseudo15,
-                         midpoint_min_max, midpoint_first_last;
-                         reordering: *_inplace
+  pivot.hpp              position pivots (first/middle/last, median_of_{3,5},
+                         ninther, medians-of-medians family, random),
+                         value pivots (pseudo-medians, midpoints),
+                         reordering variants (*_inplace)
   distributions.hpp      the input generators ("difficult cases")
   statistics.hpp         pivot-balance measurement + aggregation
   partitions.hpp         umbrella header + the three registries
-tests/                   dependency-free test framework + correctness suites
-benchmarks/              steady-clock harness + partition / pivot benchmarks
+                         --- built on the primitive: ---
+  small_sort.hpp         branchless sorting networks, n <= 24
+  small_halve.hpp        branchless HALVERS (rank-split networks, n <= 24)
+  small_halve_rev.hpp    descending halvers (reversed compare-exchange)
+  small_merge.hpp        extend/merge a mostly-sorted small block
+  reverse_partition.hpp  algo_rev::* — [>= | <] split at forward cost
+  quicksort.hpp          pure-partition size-adaptive quicksort (ascending)
+  quicksort_rev.hpp      its descending mirror
+  quicksort_lr.hpp       non-recursive left-to-right quicksort, selection leaf
+  move_low_half.hpp      move the bottom half of below-key elements to the end
+  offset_partition.hpp   forward partition with a known all->= prefix
+  offset_low_half.hpp    low-half selection with a known all->= prefix
+tests/                   dependency-free test framework + 12 suites
+benchmarks/              steady-clock harness + one benchmark per study (CSV)
 tools/                   balance_report — pivot-quality statistics
-docs/difficult-cases.md  why each adversarial input exists (with references)
+                         verify_small_{sort,halve,halve_rev} — exhaustive 0/1
+                         verification of every comparator network
+docs/                    measured findings, one report per study
+                         (difficult-cases.md explains the adversarial inputs)
 cmake/                   warning flags & helpers
 ```
 
@@ -102,30 +132,43 @@ Requires CMake ≥ 3.20 and a C++23 compiler (developed on GCC 16).
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
-ctest --test-dir build --output-on-failure        # correctness (4 suites)
+ctest --test-dir build --output-on-failure        # correctness (12 suites)
 ```
 
-The correctness suite runs ~100k checks across
-`{std_partition, lomuto, lomuto_branchless, hoare, block}` ×
+The core correctness sweep runs all registered partitioners ×
 `{i32, i64, pair64, keyed}` × all 13 distributions × {forward, reverse} ×
 {by-key, by-position} × sizes `0 … 4096`, verifying both the partition
 postcondition and that the multiset of elements is preserved. The pivot-by-key
 form is additionally tested with keys **absent** from the block (below-min and
-above-max), exercising the empty-side boundaries.
+above-max), exercising the empty-side boundaries. The remaining suites cover
+the derived algorithms (quicksorts, reversed partitions, low-half/offset
+routines, statistics, distributions).
 
 ### Benchmarks
 
+There is one benchmark per study (`benchmarks/bench_*.cpp`), each paired with a
+findings report in `docs/`. All print CSV — pipe to a file and plot. The core
+ones:
+
 ```bash
-build/benchmarks/bench_partition          # full sweep, sizes 4 … 2^22 (CSV)
+build/benchmarks/bench_partition          # full sweep, sizes 4 … 2^22
 build/benchmarks/bench_partition quick    # cap at 4096 for a fast look
 build/benchmarks/bench_partition 65536    # cap at a chosen max size
 build/benchmarks/bench_pivot              # pivot-selection cost + resulting balance
+build/benchmarks/bench_quicksort          # pure-partition quicksort sweep
 ```
 
 `bench_partition` measures the partition step **in isolation** (the pivot is
 chosen once, outside the timed region). Small blocks (4–24) are **batched** so
 many partitions are timed together and normalised to `ns_per_elem`; large
-blocks (up to 2²²) are timed singly. Output is CSV — pipe to a file and plot.
+blocks (up to 2²²) are timed singly.
+
+The two comparison benchmarks (`bench_small_sort`, `bench_small_sort_dyn`),
+which pit our small-array sort against Boost.Sort and cpp-sort, are
+**optional**: they need Boost (`libboost-dev`) and cpp-sort vendored at
+`third_party/cpp-sort` (not committed — fetch with
+`git clone https://github.com/Morwenn/cpp-sort third_party/cpp-sort`). If
+either is missing those two targets are skipped and everything else builds.
 
 ### Pivot-quality statistics
 
@@ -143,7 +186,8 @@ this pivot give?", answered without running any partition.
 
 ## What the numbers show
 
-Representative findings reproduced by this bench (your hardware will vary):
+Representative findings reproduced by this bench (your hardware will vary;
+full data in `docs/`):
 
 * **Branchless Lomuto** is ~3× faster than Lomuto/Hoare/block on small random
   `i32` blocks — the eliminated branch dominates there.
@@ -153,10 +197,21 @@ Representative findings reproduced by this bench (your hardware will vary):
 * **all_equal** drives every pivot's `mean_equal` to ~1.0 and imbalance to its
   maximum, illustrating why a 2-way split needs a three-way variant for
   duplicate-heavy data.
+* A **halver** — a comparator network that only splits a small block by rank
+  (bottom half ≤ top half, each half unordered) — needs ~20–33% fewer
+  compare-exchanges than the best known sorting network of the same size, and
+  finishing a quicksort's smallest blocks by recursive halving beats recursing
+  the partition to size 1 by ~20–35% total sort time
+  (`docs/pure_quicksort.md`).
+* A **reversed** partition (`>=` left, `<` right) costs exactly the same as a
+  forward one when done by exchanging the roles of the two scans — not by
+  negating the comparator or reverse iteration
+  (`docs/reverse_partition_report.md`). This makes "move the smallest elements
+  to the end" free of any post-partition move pass (`docs/move_low_half.md`).
 
 ## Extending
 
-* **New partition algorithm** → add a `PredicatePartitioner` to `algorithms.hpp`
+* **New partition algorithm** → add a `PivotPartitioner` to `algorithms.hpp`
   and list it in `default_partitioners()`. Optionally add an `at(...)` member
   for a position-aware fast path (see "exploiting the pivot position" above).
 * **New pivot strategy** (e.g. your own median scheme) → add a function object
@@ -170,6 +225,10 @@ Representative findings reproduced by this bench (your hardware will vary):
   block.
 * **New input** → add a generator to `distributions.hpp` and list it in
   `default_distributions()`.
+* **New sorting/halving network** → add the comparator list to
+  `small_sort.hpp` / `small_halve.hpp` *and* prove it in the corresponding
+  `tools/verify_small_*` tool — every network in the tree is verified by
+  exhaustive 0/1 enumeration (all 2^N inputs), not trusted.
 * **Multi-threaded partitions** are explicitly out of scope for now; the
   contract and harness assume single-threaded execution.
 
@@ -184,3 +243,7 @@ adversarial inputs.
   Quicksort*, ESA 2016.
 * O. Peters, *Branchless Lomuto partitioning* and *Pattern-defeating
   Quicksort* (arXiv:2106.05123).
+* B. Dobbelaere, *The smallest and fastest sorting networks for small numbers
+  of inputs* (bertdobbelaere.github.io/sorting_networks.html).
+* Mankowitz et al., *Faster sorting algorithms discovered using deep
+  reinforcement learning* (AlphaDev), Nature 618, 2023.

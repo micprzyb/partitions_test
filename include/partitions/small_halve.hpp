@@ -108,17 +108,51 @@ inline constexpr std::array<P, 48> h17 = {{{0,11},{1,15},{2,10},{7,11},{6,14},{4
 inline constexpr std::array<P, 53> h18 = {{{0,1},{2,3},{4,5},{6,7},{8,9},{10,11},{12,13},{14,15},{16,17},{0,2},{1,3},{4,12},{5,13},{6,8},{9,11},{14,16},{15,17},{0,14},{1,16},{2,15},{3,17},{0,6},{1,10},{2,9},{7,16},{8,15},{11,17},{1,4},{3,9},{5,7},{8,14},{10,12},{13,16},{2,5},{3,13},{4,14},{7,9},{8,10},{12,15},{3,5},{4,6},{11,13},{12,14},{5,12},{6,10},{7,11},{3,6},{5,7},{10,12},{11,14},{6,10},{7,11},{7,10}}};
 inline constexpr std::array<P, 59> h19 = {{{0,12},{1,4},{2,8},{3,5},{6,17},{7,11},{9,14},{15,16},{0,2},{1,7},{3,6},{4,11},{5,17},{8,12},{10,15},{13,16},{14,18},{3,10},{4,14},{5,15},{6,13},{7,9},{11,17},{16,18},{0,7},{1,10},{4,6},{9,15},{11,16},{12,17},{13,14},{0,3},{2,6},{5,7},{8,11},{12,16},{1,8},{2,9},{3,4},{6,15},{7,13},{10,11},{12,18},{2,5},{6,9},{7,12},{8,10},{11,14},{4,8},{6,10},{9,12},{5,8},{6,7},{9,11},{10,13},{7,9},{7,8},{9,10},{8,9}}};
 inline constexpr std::array<P, 63> h20 = {{{0,3},{1,7},{4,8},{6,9},{10,13},{11,15},{12,18},{14,17},{16,19},{0,14},{1,11},{2,16},{3,17},{4,12},{5,19},{6,10},{7,15},{8,18},{9,13},{0,4},{1,2},{3,8},{5,7},{11,16},{12,14},{15,19},{17,18},{2,12},{3,5},{4,11},{7,17},{8,15},{14,16},{0,1},{18,19},{2,6},{7,10},{9,12},{13,17},{1,6},{5,9},{7,11},{8,12},{10,14},{13,18},{3,5},{4,7},{8,10},{9,11},{12,15},{14,16},{5,7},{6,10},{9,13},{12,14},{6,7},{8,9},{10,11},{12,13},{7,9},{7,10},{9,12},{9,10}}};
-inline constexpr std::array<P, 69> h21 = {{{0,1},{2,3},{4,5},{6,7},{8,9},{10,11},{12,13},{14,15},{16,17},{18,19},{0,2},{1,3},{4,6},{5,7},{8,10},{9,11},{12,14},{13,15},{16,18},{17,19},{0,8},{1,9},{2,10},{3,11},{4,12},{5,13},{6,14},{7,15},{0,4},{1,5},{3,7},{8,12},{9,13},{10,14},{15,19},{2,6},{3,18},{7,20},{2,16},{3,6},{5,18},{7,17},{11,20},{9,16},{3,8},{6,12},{7,10},{11,15},{13,17},{14,18},{4,9},{1,7},{10,11},{13,16},{5,10},{6,13},{7,8},{11,14},{12,16},{5,6},{10,12},{11,13},{8,9},{10,11},{6,7},{7,8},{9,11},{8,10},{9,10}}};
-inline constexpr std::array<P, 74> h22 = {{{0,1},{2,3},{4,5},{6,7},{8,9},{10,11},{12,13},{14,15},{16,17},{18,19},{20,21},{0,2},{1,3},{4,6},{5,7},{8,12},{9,13},{14,16},{15,17},{18,20},{19,21},{0,4},{1,5},{2,6},{3,7},{8,10},{9,12},{11,13},{14,18},{15,19},{16,20},{17,21},{0,14},{1,15},{2,18},{3,19},{4,16},{5,17},{6,20},{7,21},{9,11},{10,12},{2,8},{3,11},{6,9},{10,18},{12,15},{13,19},{1,10},{3,16},{5,18},{6,14},{7,15},{8,12},{9,13},{11,20},{3,10},{4,8},{5,12},{9,16},{11,18},{13,17},{7,13},{8,14},{9,12},{7,11},{10,14},{5,10},{7,9},{11,16},{12,14},{9,11},{10,12},{9,12}}};
-inline constexpr std::array<P, 84> h23 = {{{0,1},{2,3},{4,5},{8,9},{10,11},{12,13},{14,15},{16,17},{18,19},{20,21},{0,2},{4,6},{5,7},{8,10},{9,11},{12,14},{13,15},{16,18},{17,19},{21,22},{0,4},{1,5},{2,6},{3,7},{8,12},{9,13},{10,14},{11,15},{17,21},{18,20},{19,22},{0,8},{1,9},{2,10},{3,11},{4,12},{5,13},{6,14},{7,19},{15,22},{1,2},{5,18},{9,16},{10,21},{12,20},{6,7},{15,19},{5,9},{10,18},{11,21},{12,17},{13,20},{6,16},{14,15},{3,17},{8,12},{20,21},{13,16},{3,4},{5,8},{9,12},{17,18},{7,13},{14,16},{1,8},{2,12},{3,9},{4,10},{11,17},{18,20},{2,6},{4,8},{7,11},{10,12},{13,18},{14,17},{6,9},{7,10},{11,13},{12,14},{8,9},{11,12},{9,10},{10,11}}};
-// 82-comparator halver for n=24 (split@12): SIX fewer comparators than the
-// previous 88-CE net and substantially faster for all three element types -- see
-// Plan24.md.  Found by iterated-local-search with a CEGAR + monotonicity
-// ("k-zero inputs only", C(24,12) instead of 2^24) validity check, 30-way
-// parallel across three reseeded waves (88->84->83->82), then chosen by direct
-// benchmark from the pool of 82-CE minima (optimizers/search_halve_cegar.cpp).
-// Verified by exhaustive 0/1 enumeration (tools/verify_small_halve{,_rev}).
-inline constexpr std::array<P, 82> h24 = {{{0,20},{1,12},{2,16},{3,23},{4,6},{5,10},{7,21},{11,22},{13,18},{0,3},{17,19},{1,11},{2,7},{4,17},{5,13},{6,19},{10,18},{12,22},{16,21},{20,23},{0,1},{2,4},{1,4},{3,12},{5,8},{6,9},{8,15},{15,18},{7,10},{11,20},{13,16},{14,17},{11,13},{19,21},{22,23},{2,5},{4,8},{7,14},{9,16},{15,19},{18,21},{3,9},{8,22},{0,5},{3,14},{9,20},{10,12},{3,4},{6,10},{6,11},{8,15},{9,14},{13,17},{10,13},{12,17},{16,23},{1,7},{18,22},{19,20},{4,7},{14,18},{16,19},{7,9},{10,11},{12,13},{14,16},{7,8},{5,11},{9,11},{12,14},{13,19},{15,16},{5,10},{8,9},{13,18},{14,15},{4,10},{10,12},{11,13},{9,12},{11,14},{11,12}}};
+// 65-comparator halver for n=21 (split@10): FOUR fewer comparators than the
+// previous 69-CE net (Batcher-derived, never CEGAR-searched -- it was larger than
+// the new n=22 at 68!) and substantially faster for all three element types --
+// see Plan21.md.  Found by plateau-walking iterated-local-search with a CEGAR +
+// monotonicity ("k-zero inputs only", C(21,11)=352,716 instead of 2^21) validity
+// check, 6-way parallel across four reseeded waves (69->66->65; 64 not found
+// across 1181 distinct 65-CE minima), then chosen by direct benchmark (median of
+// 9) from that pool (optimizers/search_halve_cegar2.cpp).  Verified by exhaustive
+// 0/1 enumeration (tools/verify_small_halve{,_rev}).
+inline constexpr std::array<P, 65> h21 = {{{6,7},{2,3},{4,5},{16,20},{0,1},{5,7},{8,9},{10,11},{17,18},{9,11},{14,15},{0,2},{12,13},{4,6},{8,10},{16,17},{0,8},{1,3},{12,14},{4,12},{17,19},{13,15},{1,9},{7,15},{5,13},{6,14},{3,11},{3,7},{8,12},{2,10},{3,12},{10,14},{7,19},{3,17},{7,20},{7,17},{9,13},{13,17},{12,20},{2,6},{6,13},{6,9},{3,16},{7,10},{2,16},{9,16},{4,8},{10,18},{0,8},{11,13},{1,5},{5,10},{5,6},{10,18},{6,12},{11,15},{11,14},{1,7},{6,8},{7,8},{10,16},{11,12},{10,11},{9,10},{8,10}}};
+// 68-comparator halver for n=22 (split@11): SIX fewer comparators than the
+// previous 74-CE net (Batcher-derived, never CEGAR-searched -- it had more CE
+// than n=21's 69!) and substantially faster for all three element types -- see
+// Plan22.md.  Found by plateau-walking iterated-local-search with a CEGAR +
+// monotonicity ("k-zero inputs only", C(22,11)=705,432 instead of 2^22) validity
+// check, 6-way parallel across three reseeded waves (74->68; 67 not found across
+// 1192 distinct 68-CE minima), then chosen by direct benchmark (median of 9) from
+// that pool (optimizers/search_halve_cegar2.cpp).  Verified by exhaustive 0/1
+// enumeration (tools/verify_small_halve{,_rev}).
+inline constexpr std::array<P, 68> h22 = {{{8,9},{0,1},{20,21},{2,3},{16,17},{12,13},{18,19},{19,21},{18,20},{0,2},{4,5},{1,3},{6,7},{10,11},{14,15},{4,6},{5,7},{15,17},{14,16},{2,6},{15,19},{1,5},{16,20},{8,12},{5,17},{3,7},{11,13},{6,20},{1,15},{5,21},{7,20},{6,15},{12,15},{0,4},{2,18},{6,11},{14,18},{4,16},{2,6},{6,14},{5,12},{0,1},{1,14},{7,17},{3,19},{13,21},{10,18},{9,11},{7,15},{12,18},{3,16},{5,10},{7,13},{3,12},{10,12},{7,19},{7,9},{3,7},{4,8},{11,16},{11,18},{8,14},{7,11},{9,12},{10,14},{9,14},{7,14},{9,11}}};
+// 74-comparator halver for n=23 (split@11): TEN fewer comparators than the
+// original 84-CE Batcher net, and FOUR below the 78-CE the earlier CEGAR search
+// got stuck at -- substantially faster for all three element types -- see
+// Plan23.md (PLAN B).  KEY INSIGHT: the 78 floor was a Batcher-seed-bias local
+// optimum; seeding the search from a STRUCTURALLY DIFFERENT basin -- the n=24
+// halver with a wire forced to +inf, its (.,23) comparators dropped (a valid
+// split@12 23-halver), reversed to split@11 -- let the plateau-walk descend
+// 78->75->74.  A violation-annealing engine (optimizers/anneal_halve.cpp) then
+// showed size 73 is (almost certainly) infeasible: the best 73-net still
+// mis-sorts 260/1,352,078 k-zero inputs across ~78 strong restarts, so 74 is the
+// practical floor.  Chosen by direct benchmark (median of 9) from the 550-net
+// pool of 74-CE minima.  Verified by exhaustive 0/1 enumeration
+// (tools/verify_small_halve{,_rev}).
+inline constexpr std::array<P, 74> h23 = {{{0,1},{8,9},{10,11},{14,15},{12,13},{7,21},{12,14},{2,3},{0,2},{4,5},{9,11},{16,17},{18,19},{4,6},{17,19},{20,22},{1,3},{21,22},{8,10},{7,20},{2,6},{16,18},{1,5},{17,21},{10,14},{13,15},{8,12},{0,4},{3,15},{9,13},{6,14},{1,7},{12,17},{18,20},{3,11},{3,20},{5,13},{13,15},{5,18},{2,10},{9,16},{19,22},{7,16},{3,4},{0,8},{6,19},{13,19},{10,18},{3,12},{10,21},{4,17},{1,9},{5,8},{4,12},{6,8},{11,21},{14,17},{2,9},{6,9},{9,10},{10,12},{4,9},{13,22},{12,16},{8,12},{18,20},{8,9},{13,14},{11,13},{11,18},{11,12},{7,10},{10,11},{9,11}}};
+// 80-comparator halver for n=24 (split@12): TWO below the 82-CE the original
+// CEGAR search got stuck at (which was Batcher-seed-bias, like n=23's 78) -- see
+// Plan24.md (PLAN B).  KEY INSIGHT (mirroring n=23): seed the search from a
+// STRUCTURALLY DIFFERENT basin -- the new n=23 halver (74) extended to a split@12
+// 24-halver (h23 on wires 0..22, then min of {11..22,23} sifted to position 11;
+// 86 CE, validated) -- a non-Batcher seed.  The plateau-walk then descended
+// 82->81->80; four deep reseeded waves found 1091 distinct 80-CE nets but no 79.
+// Chosen by direct benchmark (median of 9) from that pool: faster overall (big
+// pair64 win) at a slight i64 cost.  Verified by exhaustive 0/1 enumeration
+// (tools/verify_small_halve{,_rev}).  [79 hunt + annealer-verification ongoing.]
+inline constexpr std::array<P, 80> h24 = {{{4,6},{20,22},{14,15},{2,6},{12,13},{16,17},{1,3},{12,14},{7,21},{18,19},{10,11},{13,15},{8,9},{1,5},{17,19},{21,22},{9,11},{8,10},{0,23},{17,21},{2,3},{10,14},{16,18},{7,20},{2,10},{3,15},{18,20},{8,12},{4,5},{3,11},{9,13},{19,22},{12,17},{5,13},{3,20},{6,14},{9,16},{5,18},{18,21},{1,7},{14,20},{5,8},{6,19},{6,8},{3,4},{14,23},{4,17},{6,9},{1,2},{0,4},{10,18},{11,22},{3,12},{7,16},{4,12},{0,7},{11,17},{13,19},{4,7},{2,9},{7,8},{9,12},{12,16},{15,21},{11,13},{11,14},{17,18},{16,23},{8,12},{12,17},{11,12},{9,10},{7,10},{8,10},{13,16},{13,15},{10,11},{11,12},{13,14},{11,13}}};
 }  // namespace nets
 
 // Apply the halver for compile-time N; reorders [first, first+N) so the N/2

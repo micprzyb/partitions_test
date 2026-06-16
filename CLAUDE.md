@@ -7,13 +7,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure          # all 5 test suites
+ctest --test-dir build --output-on-failure          # all 12 test suites
 ctest --test-dir build -R test_partition_correctness -V   # one suite
 
 build/benchmarks/bench_partition quick              # bench (sizes capped at 4096)
 build/benchmarks/bench_pivot
 build/tools/balance_report 200                      # pivot-balance stats
 ```
+
+There is one benchmark per study (`benchmarks/bench_*.cpp`, ~19 of them, all CSV to stdout); each pairs with a findings report in `docs/`. The two comparison benchmarks (`bench_small_sort`, `bench_small_sort_dyn`) are **optional**: they need Boost (`libboost-dev`) and cpp-sort vendored at `third_party/cpp-sort` (not committed — `git clone https://github.com/Morwenn/cpp-sort third_party/cpp-sort`). When either is missing those two targets are silently skipped; everything else builds.
 
 Requires CMake ≥ 3.20 and C++23 (developed on GCC 16; CI uses g++-14 and clang++-18 with `-DPARTITIONS_NATIVE=OFF`).
 
@@ -66,6 +68,25 @@ A pivot strategy returns *either*:
 ### Partition contract
 
 Every form returns iterator `m` such that `[first, m) < pivot` and `[m, last) >= pivot`. `m` is the **boundary index**, not the resting place of any pivot element; this is what lets the by-key form work even when no element equals the pivot (`m == first` means empty left, `m == last` means empty right). Comparisons go through a single `Comp` (a strict-weak-ordering "less"); `>=` is expressed as `!(x < pivot)`.
+
+### Beyond the registry core: the derived algorithm families
+
+The registries cover the partition/pivot/distribution matrix. On top of that primitive sit several self-contained modules, each with its own `test_*.cpp`, `bench_*.cpp`, and `docs/*.md` findings report:
+
+- `quicksort.hpp` — pure-partition, size-adaptive ascending quicksort (no insertion-sort leaf; smallest blocks finish by recursive halving). `quicksort_rev.hpp` is its descending mirror; `quicksort_lr.hpp` is a non-recursive left-to-right variant with a selection-sort leaf.
+- `reverse_partition.hpp` (`algo_rev::*`) — partitioners that put `>= pivot` LEFT and `< pivot` RIGHT at identical cost to forward.
+- `small_sort.hpp` / `small_halve.hpp` / `small_halve_rev.hpp` / `small_merge.hpp` — branchless comparator networks for n ≤ 24. A *halver* splits by rank (bottom half ≤ top half, halves unordered) in ~20–33% fewer compare-exchanges than a full sorting network.
+- `move_low_half.hpp`, `offset_partition.hpp`, `offset_low_half.hpp` — selection-style routines (move/collect the bottom half of below-key elements; partition with a known all-`>=` prefix), built on the reversed family.
+
+### Two ways to reverse — don't mix them up
+
+- **Derived API forms** (`partition_api.hpp`): reversing is just passing the negated comparator `ge(a,b) = !comp(a,b)` — sound because a partition uses `comp` only as a unary predicate.
+- **Dedicated reversed partitioners** (`reverse_partition.hpp`): keep the *same* comparator and exchange the roles of the two scans/fills — identical op count to forward, which is what makes `move_low_half` free of its move epilogue.
+- **Comparator networks** (`small_halve_rev.hpp`): negating the comparator is **unsound** (the 0/1-principle proofs need a strict order; `ge` is reflexive). Reverse the compare-exchange *direction* instead (`cswap_rev` puts the larger element at the lower index).
+
+### Networks are proved, not trusted
+
+Every sorting/halving network is verified by exhaustive 0/1 enumeration (all 2^N inputs) in `tools/verify_small_sort`, `verify_small_halve`, `verify_small_halve_rev`. A new or edited network entry must pass the corresponding verifier — run it, don't reason about it.
 
 ### Test framework
 
