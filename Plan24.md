@@ -218,6 +218,23 @@ for i in 0 1 2 3 4 5; do taskset -c ${CORES[$i]} /tmp/shb2 24 ${S[$i]} 30 8000 9
 # then reseed from the frontier (see PB3-PB5 snippets) for deeper waves; census any sub-80.
 ```
 
+### PB14 — Benchmark the new 80-CE nets (from the new basins) vs committed p1057. **DONE — p1057 still best.**
+The PB12/PB13 new-basin waves produced **1072 distinct 80-CE nets, none == p1057**
+(genuinely new). Saved to `seeds/h24_80pool.txt` for further exploration.
+Benchmarked all 1072 vs p1057 (base); median-of-9 on the top contenders:
+
+| net   | i64    | pair64 | pair64f | sum    |
+|-------|--------|--------|---------|--------|
+| **p1057** | 0.6733 | 3.0013 | 1.5139  | **5.1885** |
+| p905  | 0.7007 | 3.0657 | 1.5173  | 5.2837 |
+| p592  | 0.7010 | 3.1311 | 1.4704  | 5.3025 |
+
+**p1057 wins i64, pair64, and sum** — no new 80-CE net is faster overall (best new
+~1.8% slower on sum; single-run per-type "leaders" p85/p342 regressed under
+medians). **h24 stays at p1057.** (Workflow note for next time: the 1073-net pool
+took 9.5 min to compile single-TU — chunk candidates across cores to parallelize;
+bench serially on the one quiet core. See memory `bench-pool-parallel-compile`.)
+
 ## PLAN-B FINAL SUMMARY (n=24)
 **`nets::h24`: 82 → 80 CE (p1057, committed), verified fwd+rev exhaustive 2²⁴,
 ctest 12/12, benchmark-fastest (beats all 559 distinct 81-CE nets).** The original
