@@ -21,12 +21,13 @@ cd "$(dirname "$0")/.."
 CXX=${CXX:-g++}
 JOBS=${JOBS:-30}
 CORE0=${CORE0:-2}
-# Shorter waves => the improving bound (best floor) propagates across all parallel
-# jobs sooner: every wave reseeds from the current frontier, so more frequent
-# waves = more frequent global sync.  Kept large enough that each job's ILS still
-# makes progress from a frontier seed.
-WAVE_RESTARTS=${WAVE_RESTARTS:-4}
-WAVE_ITERS=${WAVE_ITERS:-1000}
+# Each search process runs a LONG budget (long_restarts x long_iters ILS) so it has
+# time to make progress at large n; the event-driven orchestrator (run_n.py)
+# resyncs the moment the global bound improves -- it restarts only the laggards
+# from the new bound and lets the finders keep their momentum.  So per-process
+# runtime is long, but a better bound propagates immediately, not on a timer.
+LONG_RESTARTS=${LONG_RESTARTS:-15}
+LONG_ITERS=${LONG_ITERS:-1500}
 FRONTIER_CAP=${FRONTIER_CAP:-40}
 TOTAL_HOURS=${TOTAL_HOURS:-120}
 STATE=${STATE:-optimizers/campaign_state}
@@ -54,23 +55,8 @@ for n in 24 23 22 21 20 19 18; do
   if [ "$n" -lt 24 ]; then python3 optimizers/reduce_seed.py "$n" >>"$LOG" 2>&1; fi
   cp "/tmp/seeds_$n.txt" "/tmp/seeds_base_$n.txt"
 
-  log "n=$n: budget $((budget_s/60)) min (weight ${W[$n]}/$WSUM)"
-  deadline=$(( $(date +%s) + budget_s ))
-  wave=0
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    wave=$((wave+1))
-    rm -f /tmp/h${n}_*_pool.inc
-    for i in $(seq 0 $((JOBS-1))); do
-      S=$(( (wave*100003) + (i*7919) + 13 ))
-      C=$(( CORE0 + (i % JOBS) ))
-      taskset -c "$C" /tmp/sh_campaign "$n" "$S" "$WAVE_RESTARTS" "$WAVE_ITERS" 60 \
-        >/dev/null 2>>"$d/search.err" &
-    done
-    wait
-    res=$(python3 optimizers/merge_reseed.py "$n" "$FRONTIER_CAP" 2>>"$LOG")
-    left=$(( (deadline - $(date +%s)) / 60 ))
-    log "n=$n wave $wave: $res  (${left} min left)"
-  done
+  log "n=$n: budget $((budget_s/60)) min (weight ${W[$n]}/$WSUM); event-driven (long runs ${LONG_RESTARTS}x${LONG_ITERS}, restart-laggards-on-improvement)"
+  python3 optimizers/run_n.py "$n" "$budget_s" "$JOBS" "$CORE0" "$LONG_RESTARTS" "$LONG_ITERS" 60 >>"$LOG" 2>>"$d/run_n.err"
   cp "/tmp/seeds_base_$n.txt" "$d/seeds_base.txt" 2>/dev/null || true
   touch "$d/SEARCH_DONE"
   log "n=$n SEARCH_DONE ($(python3 optimizers/merge_reseed.py "$n" "$FRONTIER_CAP" 2>/dev/null))"

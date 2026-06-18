@@ -11,11 +11,11 @@
    good starting points.
 Prints: floor=<F> floornets=<C> distinct=<D>
 """
-import re, sys, glob, random
+import re, sys, glob, random, os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-STATE = ROOT / "optimizers/campaign_state"
+STATE = ROOT / os.environ.get("STATE", "optimizers/campaign_state")
 
 def nets_in(path):
     out = []

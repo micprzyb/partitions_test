@@ -14,12 +14,12 @@ seed for n.
 Source net: campaign_state/n<n+1>/best.txt if present, else the committed h(n+1)
 from include/partitions/small_halve.hpp.  Appends one line to /tmp/seeds_<n>.txt.
 """
-import re, sys
+import re, sys, os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 HALVE = ROOT / "include/partitions/small_halve.hpp"
-STATE = ROOT / "optimizers/campaign_state"
+STATE = ROOT / os.environ.get("STATE", "optimizers/campaign_state")
 
 def parse_net(s):
     return [(int(a), int(b)) for a, b in re.findall(r'\{(\d+),(\d+)\}', s)]

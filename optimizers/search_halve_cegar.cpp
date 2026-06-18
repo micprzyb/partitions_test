@@ -163,11 +163,46 @@ static Comp rand_comp(std::mt19937_64& rng) {
 
 static std::vector<Net> g_pool;
 static size_t g_pool_minsize = 9999;
+static char g_outpath[256] = "";
+static int g_capK = 60;
+static size_t g_written = 9999;
+
+// Write the current floor pool to g_outpath atomically (tmp + rename) so the
+// event-driven orchestrator can read complete files while this process keeps
+// searching, and react the instant the global bound improves.
+static void write_pool() {
+    if (!g_outpath[0]) return;
+    std::vector<Net> pool = g_pool;
+    std::sort(pool.begin(), pool.end(),
+              [](const Net& a, const Net& b) { return depth(a) < depth(b); });
+    char tmp[300];
+    std::snprintf(tmp, sizeof tmp, "%s.tmp", g_outpath);
+    FILE* f = std::fopen(tmp, "w");
+    if (!f) return;
+    int emitted = 0;
+    for (auto& nn : pool) {
+        if (emitted >= g_capK) break;
+        std::fprintf(f, "inline constexpr std::array<P,%zu> p%d = {{", nn.size(), emitted);
+        for (auto [a, b] : nn) std::fprintf(f, "{%d,%d},", a, b);
+        std::fprintf(f, "}}; // depth %d\n", depth(nn));
+        ++emitted;
+    }
+    std::fprintf(f, "#define HN_POOL_N %d\n#define HN_POOL_LIST ", emitted);
+    for (int i = 0; i < emitted; ++i) std::fprintf(f, "X(p%d) ", i);
+    std::fprintf(f, "\n");
+    std::fclose(f);
+    std::rename(tmp, g_outpath);
+}
+
 static void pool_add(const Net& n) {
     if (n.size() > g_pool_minsize) return;
     if (n.size() < g_pool_minsize) { g_pool.clear(); g_pool_minsize = n.size(); }
     for (auto& e : g_pool) if (e == n) return;
     g_pool.push_back(n);
+    if (g_pool_minsize < g_written) {  // flush the moment we improve the bound
+        g_written = g_pool_minsize;
+        write_pool();
+    }
 }
 
 static Net ils(Net seed, std::mt19937_64& rng, int iters) {
@@ -198,6 +233,9 @@ int main(int argc, char** argv) {
     int restarts = (argc > 3) ? std::atoi(argv[3]) : 8;
     int iters = (argc > 4) ? std::atoi(argv[4]) : 1500;
     int K = (argc > 5) ? std::atoi(argv[5]) : 40;
+    g_capK = K;
+    if (argc > 6) std::snprintf(g_outpath, sizeof g_outpath, "%s", argv[6]);
+    else std::snprintf(g_outpath, sizeof g_outpath, "/tmp/h%d_%lu_pool.inc", N, seed0);
 
     std::vector<Net> seeds;
     {
@@ -242,22 +280,7 @@ int main(int argc, char** argv) {
     for (auto [a, b] : best) std::printf("{%d,%d},", a, b);
     std::printf("\n");
 
-    std::sort(g_pool.begin(), g_pool.end(),
-              [](const Net& a, const Net& b) { return depth(a) < depth(b); });
-    char path[80]; std::snprintf(path, sizeof path, "/tmp/h%d_%lu_pool.inc", N, seed0);
-    FILE* f = std::fopen(path, "w");
-    int emitted = 0;
-    for (auto& n : g_pool) {
-        if (emitted >= K) break;
-        std::fprintf(f, "inline constexpr std::array<P,%zu> p%d = {{", n.size(), emitted);
-        for (auto [a, b] : n) std::fprintf(f, "{%d,%d},", a, b);
-        std::fprintf(f, "}}; // depth %d\n", depth(n));
-        ++emitted;
-    }
-    std::fprintf(f, "#define HN_POOL_N %d\n#define HN_POOL_LIST ", emitted);
-    for (int i = 0; i < emitted; ++i) std::fprintf(f, "X(p%d) ", i);
-    std::fprintf(f, "\n");
-    std::fclose(f);
-    std::fprintf(stderr, "wrote %s (%d nets, minsize %zu)\n", path, emitted, g_pool_minsize);
+    write_pool();  // final flush (also flushed incrementally on every improvement)
+    std::fprintf(stderr, "wrote %s (minsize %zu)\n", g_outpath, g_pool_minsize);
     return 0;
 }
