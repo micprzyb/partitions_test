@@ -117,6 +117,33 @@
 //     dispatcher 1.68 vs 2.54 with i64 entries) -- half the scattered-line
 //     footprint.  Both widths (and iterator entries) are supported.
 //
+//   * UNSIGNED PAIRS (pair<u32,u32> and pair<u64,u64>, id = .second),
+//     compared BY FIRST or LEXICOGRAPHICALLY:
+//       - std::less<> on the pair (lex) is a short-circuit two-field compare
+//         whose second branch is data-dependent: it turns the branchless
+//         kernels branchy and loses 2-2.8x at balanced splits (gap-Lomuto,
+//         pair<u32,u32>, n=4096, p=.5: 5.91 vs 2.41 ns/elem by-first).  For
+//         UNSIGNED members lex order equals the numeric order of the
+//         concatenation first:second, so the entry points REWRITE
+//         (std::less<>, identity, key) into a wide-compare projection (u64
+//         for 4+4-byte pairs; unsigned __int128 for 8+8, GCC/Clang) before
+//         dispatching -- verified branchless (cmp+adc / cmp+sbb per element)
+//         and the lex penalty collapses to 3-10% (pair<u32,u32>, n=1024,
+//         p=.5: 5.51 -> 2.08).  Note key = {k, 0} makes the lex API an exact
+//         (and faster) replacement for a by-first partition.
+//       - 8-byte pairs are their own dispatch class: the mirrored block
+//         partition beats every repair variant from ~192 elements at EVERY
+//         below-fraction (p=.5: 1.46-2.88 vs repair 1.87-3.53; the pair
+//         field extraction taxes the gap kernel's dependent move chain), so
+//         they skip the Lomuto tier and the probe up to 2048 and take the
+//         mirrored block partition when balanced.
+//       - 16-byte pairs behave like the 16-byte records above: repair when
+//         balanced until ~2^20, mirror beyond, mirrored Hoare when very
+//         skewed (0.89-0.99 ns/elem at p=.02/.98).
+//     Dispatcher end-to-end, by-first / lex (ns/elem): pair<u32,u32> p=.02:
+//     0.69-1.93 / 0.70-2.11; p=.5: 1.51-2.99 / 1.70-2.75.  pair<u64,u64>
+//     p=.02: 0.92-2.17 / 1.00-2.22; p=.5: 1.63-3.68 / 1.70-3.98.
+//
 //   * Offset partition: the SUFFIX below-fraction decides.  Low p:
 //     prefix-fill + mirror (2^20, offset=.75n, p=.1: 0.68 vs 2.36 for
 //     kernel+full-repair -- 3.5x).  Mid/high p: gap + NARROWED repair
@@ -135,11 +162,15 @@
 // strided probes estimates p first -- <= 2% cost at the sizes where it runs):
 //
 //   sized_partition_perm:
-//     n <= 2048                    -> gap-Lomuto + repair
+//     unsigned pair + std::less<> + identity -> wide-compare rewrite first
+//     8-byte pairs: n <= 192 -> gap-Lomuto + repair; n <= 2048 -> mirrored
+//                   block partition (no probe)
+//     others:       n <= 2048 -> gap-Lomuto + repair
 //     p^ outside [1/4, 3/4]        -> mirrored block partition (AVX2 fills
 //                                     when eligible; very skewed non-SIMD
 //                                     -> mirrored Hoare)
 //     else (balanced):
+//       8-byte pair                -> mirrored block partition
 //       sizeof(T) <= 8, n <= 2^17  -> gap-Lomuto + repair
 //       sizeof(T) >  8, n >= 2^21  -> mirrored block partition
 //       otherwise                  -> plain sized_partition + full repair
@@ -169,6 +200,81 @@
 #endif
 
 namespace partitions::detail::perm {
+
+// ---------------------------------------------------------------------------
+// Lexicographic unsigned-pair rewrite.  std::less<> on a std::pair is a
+// short-circuit two-field compare; GCC lowers the below-key predicate built
+// from it to a data-dependent BRANCH (verified in the disassembly of the
+// gap-Lomuto loop: cmp/je + cmp/jae per element), which mispredicts on
+// balanced splits -- measured 2.8x slower than the by-first projection at
+// p = 0.5 on pair<u32,u32>.  For UNSIGNED members, lexicographic order over
+// (first, second) is EXACTLY the numeric order of the concatenation
+// first:second, so the dispatcher rewrites (std::less<>, identity, key) into
+// (std::less<>, concat-projection, concat(key)) before running: one wide
+// unsigned compare per element, branchless in every kernel, zero kernel
+// changes.  pairs up to 4+4 bytes concatenate into u64; 8+8 into unsigned
+// __int128 (GCC/Clang; elsewhere the rewrite simply does not fire).
+// ---------------------------------------------------------------------------
+template <class T>
+concept unsigned_pair = std::is_class_v<T> && requires(T t) {
+    t.first;
+    t.second;
+} && std::is_unsigned_v<decltype(std::declval<T&>().first)> &&
+    std::is_unsigned_v<decltype(std::declval<T&>().second)> &&
+    sizeof(T) == sizeof(std::declval<T&>().first) +
+                     sizeof(std::declval<T&>().second);
+
+#if defined(__GNUC__) || defined(__clang__)
+#define PARTITIONS_PERM_HAS_U128 1
+__extension__ typedef unsigned __int128 u128;
+#else
+#define PARTITIONS_PERM_HAS_U128 0
+#endif
+
+// NOTE: the member accesses live in constrained partial specialisations, not
+// in the primary template: a variable-template initialiser is not a SFINAE
+// context, so `unsigned_pair<T> && sizeof(declval<T&>().first) <= 4` would
+// HARD-ERROR for any non-pair T even though && short-circuits its value.
+template <class T>
+inline constexpr bool lex_rewrite_64 = false;
+template <unsigned_pair T>
+inline constexpr bool lex_rewrite_64<T> =
+    sizeof(std::declval<T&>().first) <= 4 &&
+    sizeof(std::declval<T&>().second) <= 4;
+
+template <class T>
+inline constexpr bool lex_rewrite_128 = false;
+#if PARTITIONS_PERM_HAS_U128
+template <unsigned_pair T>
+inline constexpr bool lex_rewrite_128<T> =
+    !lex_rewrite_64<T> && sizeof(std::declval<T&>().first) <= 8 &&
+    sizeof(std::declval<T&>().second) <= 8;
+#endif
+
+struct lex_concat64 {
+    template <class T>
+    PARTITIONS_PERM_ALWAYS_INLINE std::uint64_t operator()(const T& x) const {
+        constexpr unsigned sb = 8 * sizeof(x.second);
+        return (static_cast<std::uint64_t>(x.first) << sb) |
+               static_cast<std::uint64_t>(x.second);
+    }
+};
+#if PARTITIONS_PERM_HAS_U128
+struct lex_concat128 {
+    template <class T>
+    PARTITIONS_PERM_ALWAYS_INLINE u128 operator()(const T& x) const {
+        constexpr unsigned sb = 8 * sizeof(x.second);
+        return (static_cast<u128>(x.first) << sb) |
+               static_cast<u128>(x.second);
+    }
+};
+#endif
+
+template <class T, class Comp, class Proj>
+inline constexpr bool lex_rewritable =
+    (std::is_same_v<Comp, std::less<>> || std::is_same_v<Comp, std::less<T>>)&&
+    std::is_same_v<Proj, std::identity> &&
+    (lex_rewrite_64<T> || lex_rewrite_128<T>);
 
 // ---------------------------------------------------------------------------
 // Entry representation.  Entries are either the data iterator itself or an
@@ -273,6 +379,114 @@ PARTITIONS_PERM_ALWAYS_INLINE void swap_offsets_perm(
             fix_at(perm, id, em, last - offsets_r[i]);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// FULCRUM partition with FUSED permutation writes.
+//
+// The fulcrum scheme (Peters / van den Hoven; the scalar ancestor of the AVX2
+// compress kernel) buys two properties no swap- or gap-based kernel has:
+//
+//   * STRUCTURALLY branchless data movement: every element is written
+//     unconditionally to BOTH write cursors (the losing copy lands in the
+//     open gap and is later overwritten); the predicate feeds only integer
+//     cursor arithmetic (l += b; r -= !b).  There is no value select and no
+//     conditional store for the compiler to re-branch -- the recurring
+//     if-conversion hazard has no attack surface in the mover itself (the
+//     below-PREDICATE can still be branchy for short-circuit comparators;
+//     the entry points' unsigned-pair rewrite handles that).
+//
+//   * every element's FINAL position is known at the instant it is placed
+//     (the winning cursor), so the permutation entry can be written IN the
+//     same pass -- fusing what repair does in a second sweep.  No other
+//     kernel here can fuse: Lomuto moves elements repeatedly, the block
+//     partition knows final positions only per swapped pair.
+//
+// Cost per element: 1 sequential load + 2 sequential stores + 1 scattered
+// perm store, ONE pass over the data (lomuto+repair streams it twice).
+// Requires n >= 2*fulcrum_buf.
+//
+// MEASURED VERDICT (Zen 3): kept as a reference kernel, NOT dispatched.  With
+// chunked reads it reaches within ~15-40% of the adaptive dispatcher at
+// balanced splits on <= 8-byte elements (i64 n=65536, p=.5: 2.87 vs 1.80;
+// it even wins one cell, 16-byte records at n=4096, p=.5: 2.21 vs 2.41), but
+// it can never compete at skewed splits (it relocates every element where
+// mirror touches ~2p(1-p)n: 2.8-5.7 vs 0.7-1.0 at p=.02), 16-byte pairs pay
+// double 16-byte stores (5.2-7.3 vs 2.5-3.8), and past L3 its bidirectional
+// read + three write streams defeat the prefetchers (2^22: 5.3 vs 2.5).  The
+// single-pass fusion advantage never outweighs losing the O(moved-only)
+// option.  Structurally it remains the most if-conversion-robust mover: the
+// predicate feeds only cursor arithmetic, there is no value select to
+// re-branch (see check_branchless.py).
+// ---------------------------------------------------------------------------
+// Buffer per side and read-chunk size.  Chunked reads are crumsort's trick:
+// a PER-ELEMENT read-side selection is a data-dependent branch that follows
+// the below pattern and mispredicts at balanced splits (measured 2x); one
+// side decision per chunk of 16 amortises it away.  Safety: slack(L)+slack(R)
+// is invariant 2*fulcrum_buf = 4 chunks, and a chunk is read from a side with
+// slack < chunk only if the other has >= 3 chunks, so both slacks stay >= 1
+// at every write.
+inline constexpr std::ptrdiff_t fulcrum_buf = 32;
+inline constexpr std::ptrdiff_t fulcrum_chunk = 16;
+
+template <std::random_access_iterator I, class K, class PermIt, class Id,
+          class EM, class Comp, class Proj>
+inline I fulcrum_perm(I first, I last, K key, PermIt perm, Id& id,
+                      const EM& em, Comp comp, Proj proj) {
+    using T = std::iter_value_t<I>;
+    using D = std::iter_difference_t<I>;
+    constexpr D B = fulcrum_buf;
+    constexpr D C = fulcrum_chunk;
+    T tmp[2 * B];
+    for (D k = 0; k < B; ++k) tmp[k] = first[k];
+    for (D k = 0; k < B; ++k) tmp[B + k] = last[k - B];
+
+    I l = first, r = last;        // write cursors (belows at l, aboves at --r)
+    I i = first + B, j = last - B;  // read cursors over the unread middle
+    auto place = [&](const T& v) {
+        const bool b = static_cast<bool>(
+            std::invoke(comp, std::invoke(proj, v), key));
+        *l = v;
+        *(r - 1) = v;
+        I pos = b ? l : r - 1;    // final resting place, known NOW
+        perm[std::invoke(id, v)] = em(pos);
+        l += static_cast<D>(b);
+        r -= static_cast<D>(!b);
+    };
+    // Chunk reads: LEFT chunks are consumed ascending (the ascending below
+    // writes trail the reads), RIGHT chunks DESCENDING (the descending above
+    // writes trail the reads) -- consuming a right chunk bottom-up would let
+    // an above write at r-1 clobber a not-yet-read element of the chunk.
+    while (j - i >= C) {
+        bool from_left;
+        if (r - j < C)
+            from_left = false;    // right gap low -> replenish from the right
+        else if (i - l < C)
+            from_left = true;     // left gap low -> replenish from the left
+        else
+            from_left = i - l <= r - j;  // both fine: smaller-slack side
+        if (from_left) {
+            const I src = i;
+            i += C;
+            for (D k = 0; k < C; ++k) place(src[k]);
+        } else {
+            j -= C;
+            for (D k = C; k-- > 0;) place(j[k]);
+        }
+    }
+    while (i < j) {               // < C leftovers: per-element side rule
+        T v;
+        if (i - l <= r - j) {
+            v = *i;
+            ++i;
+        } else {
+            --j;
+            v = *j;
+        }
+        place(v);
+    }
+    for (D k = 0; k < 2 * B; ++k) place(tmp[k]);
+    return l;  // l == r: the boundary
 }
 
 // ---------------------------------------------------------------------------
@@ -510,16 +724,50 @@ template <std::random_access_iterator I, std::sentinel_for<I> S, class K,
 I sized_partition_perm(I first, S last, K key, PermIt perm, Id id,
                        Comp comp = {}, Proj proj = {}) {
     namespace dp = detail::perm;
+    // Unsigned-pair lexicographic rewrite: one wide branchless compare per
+    // element instead of std::less<>'s short-circuit two-field compare (which
+    // GCC lowers to a mispredicting branch; measured 2.8x at p = 0.5).
+    if constexpr (dp::lex_rewritable<std::iter_value_t<I>, Comp, Proj> &&
+                  std::is_same_v<std::remove_cvref_t<K>,
+                                 std::iter_value_t<I>>) {
+        if constexpr (dp::lex_rewrite_64<std::iter_value_t<I>>) {
+            return sized_partition_perm(first, last, dp::lex_concat64{}(key),
+                                        perm, id, std::less<>{},
+                                        dp::lex_concat64{});
+        }
+#if PARTITIONS_PERM_HAS_U128
+        else {
+            return sized_partition_perm(first, last, dp::lex_concat128{}(key),
+                                        perm, id, std::less<>{},
+                                        dp::lex_concat128{});
+        }
+#endif
+    }
     I end = first + (last - first);
     const auto n = end - first;
     if (n <= 0) return end;
 
     auto em = dp::make_entry(first, end, perm, id);
-    if (n <= dp::perm_small_cutoff) {
+    // Small 8-byte PAIRS (e.g. pair<u32,u32>) are a class of their own: the
+    // mirrored block partition beats every repair variant from ~192 elements
+    // at every below-fraction (the pairs' field extraction taxes the gap
+    // kernel's dependent-move chain), so they skip both the Lomuto tier and
+    // the probe earlier.
+    constexpr bool small_pair8 =
+        detail::net::pair_like_swappable<std::iter_value_t<I>> &&
+        sizeof(std::iter_value_t<I>) <= 8;
+    constexpr std::ptrdiff_t small_cut =
+        small_pair8 ? 192 : dp::perm_small_cutoff;
+    if (n <= small_cut) {
         // gap kernel moves everything; repair the (cache-resident) range.
         I m = detail::scalar::lomuto_branchless(first, end, key, comp, proj);
         dp::repair(first, end, perm, id, em);
         return m;
+    }
+    if constexpr (small_pair8) {
+        if (n <= dp::perm_small_cutoff)
+            return dp::block_perm<false>(first, end, key, perm, id, em, comp,
+                                         proj);
     }
     // Estimate the below-fraction: it decides whether the mirrored block
     // partition (scattered perm traffic ~ 2p(1-p)n) or a full-speed plain
@@ -545,7 +793,12 @@ I sized_partition_perm(I first, S last, K key, PermIt perm, Id id,
     // scale still prefer the mirror (the data stream itself is heavy;
     // measured 3.91 vs 4.80 at n = 2^22 on 16-byte records); everything
     // else: fastest plain kernel + full repair.
-    if constexpr (sizeof(std::iter_value_t<I>) <= 8) {
+    if constexpr (small_pair8) {
+        // Balanced 8-byte pairs keep preferring the mirrored block partition
+        // at every size (measured: 1.9-2.9 vs repair 2.3-3.5 ns/elem).
+        return dp::block_perm<false>(first, end, key, perm, id, em, comp,
+                                     proj);
+    } else if constexpr (sizeof(std::iter_value_t<I>) <= 8) {
         if (n <= dp::perm_lomuto_mid_cutoff) {
             I m = detail::scalar::lomuto_branchless(first, end, key, comp,
                                                     proj);
@@ -673,6 +926,23 @@ std::ptrdiff_t offset_partition_perm(It first, It last,
                                      PermIt perm, Id id, Comp comp = {},
                                      Proj proj = {}) {
     namespace dp = detail::perm;
+    // Same unsigned-pair lexicographic rewrite as sized_partition_perm.
+    if constexpr (dp::lex_rewritable<std::iter_value_t<It>, Comp, Proj> &&
+                  std::is_same_v<std::remove_cvref_t<K>,
+                                 std::iter_value_t<It>>) {
+        if constexpr (dp::lex_rewrite_64<std::iter_value_t<It>>) {
+            return offset_partition_perm(first, last, offset,
+                                         dp::lex_concat64{}(key), perm, id,
+                                         std::less<>{}, dp::lex_concat64{});
+        }
+#if PARTITIONS_PERM_HAS_U128
+        else {
+            return offset_partition_perm(first, last, offset,
+                                         dp::lex_concat128{}(key), perm, id,
+                                         std::less<>{}, dp::lex_concat128{});
+        }
+#endif
+    }
     const auto suffix = (last - first) - offset;
     // Tiny suffix: the gap kernel + narrowed repair (its touched ranges are
     // cache-resident).
