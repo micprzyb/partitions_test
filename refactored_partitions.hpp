@@ -27,6 +27,20 @@
 //         ninther / median-of-5-medians-of-5 pivot and run the keyed
 //         dispatcher, returning the pivot placed at its final sorted rank.
 //         Size tiers are the source repo's measured pure-quicksort settings.
+//   * cyclic_partition(first, last, buf_begin, buf_end, key, comp, proj)
+//     cyclic_partition_count(...)                     -> iterator / count
+//     cyclic_offset_partition(first, last, buf_begin, buf_end, offset, key,
+//                             comp, proj)             -> count
+//         The same partition / offset partition over a possibly-WRAPPED range
+//         of a cyclic buffer [buf_begin, buf_end): first > last means the
+//         range spans [first, buf_end) ++ [buf_begin, last).  See the
+//         detail::cyclic section header for the range convention, contract
+//         and design (idea log + measurements: cyclic_partitions.txt).
+//   * find_min(first, last, comp, proj)                -> iterator
+//     cyclic_find_min(first, last, buf_begin, buf_end, comp, proj) -> iterator
+//         An iterator to A minimal element (any-minimal tie rule) of a flat /
+//         possibly-wrapped range; key-width-dispatched kernels from the
+//         source repo's find-minimum study (see the detail::minsel section).
 //
 // DESIGN NOTES OF THIS REFACTORING
 //
@@ -130,6 +144,16 @@
 // between two elements, not only against the key).  Do not pass a
 // negated/reflexive comparator.
 //
+// PAIR-LEX SUBSTITUTION.  When the element is pair-like, the key is the
+// element type, comp is the default less and proj is identity, every public
+// entry point (flat and cyclic) transparently swaps comp for a pinned scan
+// comparator of IDENTICAL order (detail::net: lex_less_packed for 4+4-byte
+// integer pairs -- one u64 compare; lex_less_semibranch otherwise -- the
+// short-circuit optimum pinned at source level).  Rationale and measured
+// numbers: the section above detail::net's comparator block and
+// cyclic_partitions.txt rounds 2-3.  NaN in float members is outside the
+// strict-weak-ordering contract, as everywhere else in this file.
+//
 // THE PIVOT KEY IS TAKEN BY VALUE, not `const K&` or `K&&`: a partition
 // permutes the block while comparing against the key, so a *reference* key
 // makes the compiler assume aliasing and reload it from memory on every
@@ -149,6 +173,7 @@
 #include <cstring>
 #include <functional>
 #include <iterator>
+#include <memory>
 #include <type_traits>
 #include <utility>
 
@@ -171,6 +196,22 @@
 #endif
 #if !defined(PARTITIONS_HALVE_MID_MAX)
 #define PARTITIONS_HALVE_MID_MAX 0
+#endif
+// Cyclic-partition gap-tier gates (see tuning::cyclic_* below).  The gates
+// are SOUND at any value -- every kernel is correct at every size -- only the
+// crossover is architecture-dependent (defaults measured on Meteor Lake; the
+// same portability contract as PARTITIONS_L2_BYTES).
+#if !defined(PARTITIONS_CYCLIC_GAP_MAX)
+#define PARTITIONS_CYCLIC_GAP_MAX 1024
+#endif
+#if !defined(PARTITIONS_CYCLIC_GAP_MAX_SIMD)
+#define PARTITIONS_CYCLIC_GAP_MAX_SIMD 512
+#endif
+#if !defined(PARTITIONS_CYCLIC_OFF_GAP_MAX)
+#define PARTITIONS_CYCLIC_OFF_GAP_MAX 1024
+#endif
+#if !defined(PARTITIONS_CYCLIC_OFF_GAP_MAX_SIMD)
+#define PARTITIONS_CYCLIC_OFF_GAP_MAX_SIMD 256
 #endif
 
 // ===========================================================================
@@ -217,6 +258,45 @@ inline constexpr std::ptrdiff_t compress_max =
 // -- keyed-dispatch halver-tier gate (OFF by default; see the file header) ---
 inline constexpr std::ptrdiff_t halve_mid_max =
     PARTITIONS_HALVE_MID_MAX > 24 ? 24 : PARTITIONS_HALVE_MID_MAX;
+
+// -- cyclic dispatch (cyclic_partition / cyclic_offset_partition) ------------
+// Gate of the gap_cyclic tier (the wrapped branchless-Lomuto gap kernel: no
+// setup, no bridge, ~1 extra cmov per element) versus the two-segment
+// kernels.  Two comparator classes behave differently enough to need their
+// own gates (measured, Meteor Lake, min ns/elem over all wrap fractions --
+// regret tables in cyclic_partitions.txt):
+//
+//   * pair-lex (a pair-like element under the default `<`): the compare is a
+//     short-circuit branch, so the gap walk mispredicts per element just like
+//     everything else while the block kernels amortise better -> tiny gate
+//     (24), seg_bridge above it (the fused fill's scattered rotation loses to
+//     the vectorised bridge at every mid wrap for this class).
+//   * AVX2-eligible integers: the gap walk holds ~0.48 ns/elem flat in the
+//     wrap fraction, but the vectorised segment kernels pull ahead once their
+//     setup amortises -> gate 512, seg_fill above it.
+//   * everything else (cheap branchless compare, no SIMD kernels to amortise
+//     against): gate 1024, seg_fill above it.
+//
+// For the OFFSET partition the gate is on the SUFFIX (compared) length; the
+// AVX2 integer fast path scans with vfill_right, which overtakes the gap walk
+// earlier (256).
+inline constexpr std::ptrdiff_t cyclic_gap_max_lex = 24;
+inline constexpr std::ptrdiff_t cyclic_gap_max_simd = PARTITIONS_CYCLIC_GAP_MAX_SIMD;
+inline constexpr std::ptrdiff_t cyclic_gap_max = PARTITIONS_CYCLIC_GAP_MAX;
+inline constexpr std::ptrdiff_t cyclic_off_gap_max_lex = 24;
+inline constexpr std::ptrdiff_t cyclic_off_gap_max_simd = PARTITIONS_CYCLIC_OFF_GAP_MAX_SIMD;
+inline constexpr std::ptrdiff_t cyclic_off_gap_max = PARTITIONS_CYCLIC_OFF_GAP_MAX;
+// The MULTI-setcc branchless-lex comparator (lex_less_branchless, i.e. the
+// pair-lex substitution) gets its own gates: its 3-setcc predicate is
+// vulnerable to a GCC register-allocation hazard in SOME instantiation
+// contexts (a setcc landing on a register that carries a store-forwarded
+// reload puts ~6 extra cycles on the gap loop's carried dependency --
+// measured 2.6x, context-dependent; forensics in cyclic_partitions.txt
+// round 2).  The gates below are tuned to the DISPATCHER-context codegen:
+// tiny gap tier, seg_bridge through mid sizes, seg_fill above.
+inline constexpr std::ptrdiff_t cyclic_gap_max_mlex = 24;
+inline constexpr std::ptrdiff_t cyclic_bridge_max_mlex = 1024;
+inline constexpr std::ptrdiff_t cyclic_off_gap_max_mlex = 256;
 
 // -- median_partition tiers (the source quicksort's measured bounds) ---------
 // 24 is the largest hand-built halver (raising the halve cutoff from 16 to 24
@@ -535,6 +615,118 @@ inline void halve_sort(It first, It last, Cmp comp, Proj proj) {
     halve_sort(first, mid, comp, proj);
     halve_sort(mid, last, comp, proj);
 }
+
+// ===========================================================================
+// Pair-lex comparators for PARTITION SCANS (element vs one fixed key), and
+// the substitution the public entry points perform.
+//
+// The comparator's optimal form is CLASS-dependent, and the two classes have
+// opposite answers (both measured; do not port a fix across the boundary):
+//
+//   * element-vs-element compare-EXCHANGES (the halver/sorter networks): the
+//     fully branchless `(b0<a0)|(b0==a0 & b1<a1)` + XOR-mask swap wins
+//     2.4-4.5x -- that is cswap's fast path above, unchanged.
+//   * element-vs-FIXED-KEY scans (every partition kernel in this file): the
+//     source repo's algorithms.hpp keeps the branchless form as a NEGATIVE
+//     result (~30-47% slower at large n): the good lowering of the
+//     short-circuit is `cmp first; je <second-key>` -- the branch fires only
+//     on first-key TIES, rare on high-cardinality data, so it predicts
+//     perfectly and the second-key load is SKIPPED.  The branchless form
+//     pays the second key on every element for a predictor win that does
+//     not exist here.
+//
+// PROBLEM: which lowering `pair::operator<` actually gets is decided by GCC
+// per inlining context; some contexts get a ~50/50 mispredicting branch on
+// the first-key ORDER instead (measured 1.9-3.6 ns/elem where the good
+// lowering runs ~0.6 -- the round-2/3 forensics in cyclic_partitions.txt).
+// The two comparators below remove the lottery:
+//
+//   * lex_less_packed: a 4+4-byte INTEGER pair loads as one u64
+//     (little-endian: .first in the low half); rotl(32) + a sign-bias XOR
+//     maps lex order onto ONE unsigned compare.  Exactly operator<, no
+//     branch, no setcc chain, nothing to mis-lower; strictly the fastest
+//     known form for these types.
+//   * lex_less_semibranch: the documented-optimal short-circuit shape,
+//     PINNED at the source level -- one compare of .first serves both the
+//     [[unlikely]] tie branch and the ordering result, so every context
+//     compiles to the algorithms.hpp fast form (cmov/setcc main path +
+//     rarely-taken je).  Matches operator< exactly on +/-0.0 ties; NaN is
+//     outside the strict-weak-ordering contract as everywhere else.
+//
+// The 3-setcc lex_less_branchless is kept for reference measurement and as
+// the big-endian fallback; scans never pick it by default anymore.
+// ===========================================================================
+
+struct lex_less_branchless {
+    template <class P>
+    PARTITIONS_ALWAYS_INLINE bool operator()(const P& a, const P& b) const {
+        const auto af = a.first;
+        const auto as = a.second;
+        const auto bf = b.first;
+        const auto bs = b.second;
+        const unsigned lt0 = static_cast<unsigned>(af < bf);
+        const unsigned eq0 = static_cast<unsigned>(af == bf);
+        const unsigned lt1 = static_cast<unsigned>(as < bs);
+        return (lt0 | (eq0 & lt1)) != 0;
+    }
+};
+
+struct lex_less_semibranch {
+    template <class P>
+    PARTITIONS_ALWAYS_INLINE bool operator()(const P& a, const P& b) const {
+        if (a.first == b.first) [[unlikely]]
+            return a.second < b.second;
+        return a.first < b.first;
+    }
+};
+
+template <class T>
+concept int_pair_packable =
+    lex_pair_like<T> && sizeof(T) == 8 &&
+    std::is_integral_v<std::remove_reference_t<decltype(std::declval<T&>().first)>> &&
+    std::is_integral_v<std::remove_reference_t<decltype(std::declval<T&>().second)>> &&
+    sizeof(std::declval<T&>().first) == 4 &&
+    sizeof(std::declval<T&>().second) == 4 &&
+    std::endian::native == std::endian::little;
+
+struct lex_less_packed {
+    template <class P>
+    PARTITIONS_ALWAYS_INLINE static std::uint64_t pack(const P& p) {
+        std::uint64_t v;
+        std::memcpy(&v, &p, 8);  // little-endian: .first is the LOW half
+        v = std::rotl(v, 32);    // .first -> high half
+        constexpr std::uint64_t bias =
+            (std::is_signed_v<std::remove_reference_t<decltype(p.first)>>
+                 ? 0x8000000000000000ull
+                 : 0ull) |
+            (std::is_signed_v<std::remove_reference_t<decltype(p.second)>>
+                 ? 0x80000000ull
+                 : 0ull);
+        return v ^ bias;
+    }
+    template <class P>
+    PARTITIONS_ALWAYS_INLINE bool operator()(const P& a, const P& b) const {
+        return pack(a) < pack(b);
+    }
+};
+
+// Substitute at a public entry point only when the comparison the kernels
+// would otherwise run is std::pair's operator< with the pair as the key:
+// the key IS the element type, the comparator is the default less, and the
+// projection is identity.
+template <class It, class K, class Comp, class Proj>
+inline constexpr bool use_lex_subst =
+    lex_pair_like<std::remove_cvref_t<K>> &&
+    std::is_same_v<std::remove_cvref_t<K>, std::iter_value_t<It>> &&
+    (std::is_same_v<Comp, std::less<>> ||
+     std::is_same_v<Comp, std::less<std::iter_value_t<It>>>) &&
+    std::is_same_v<Proj, std::identity>;
+
+// The comparator the substitution installs for a given element type.
+template <class T>
+using subst_lex_comp_t =
+    std::conditional_t<int_pair_packable<T>, lex_less_packed,
+                       lex_less_semibranch>;
 
 }  // namespace partitions::detail::net
 
@@ -1330,6 +1522,19 @@ inline constexpr bool simd_fast_path = false;
 template <std::random_access_iterator I, std::sentinel_for<I> S, class K,
           class Comp = std::less<>, class Proj = std::identity>
 I sized_partition(I first, S last, K key, Comp comp = {}, Proj proj = {}) {
+    // Pair-lex under the default `<`: swap in the pinned scan comparator
+    // (lex_less_packed for 4+4-byte integer pairs, lex_less_semibranch
+    // otherwise -- see detail::net) and re-dispatch.  Same order, immune to
+    // the context-dependent lowering of pair::operator< (measured up to
+    // ~3x; cyclic_partitions.txt rounds 2-3).  Skipped when the halver tier
+    // is enabled: that tier really sorts, and the networks' own comparator
+    // fast path (cswap) must keep seeing the default less.
+    if constexpr (detail::net::use_lex_subst<I, K, Comp, Proj> &&
+                  tuning::halve_mid_max == 0) {
+        return sized_partition(
+            first, last, key,
+            detail::net::subst_lex_comp_t<std::iter_value_t<I>>{}, proj);
+    } else {
     I end = first + (last - first);
     const auto n = end - first;
     if constexpr (tuning::halve_mid_max > 0) {
@@ -1347,6 +1552,7 @@ I sized_partition(I first, S last, K key, Comp comp = {}, Proj proj = {}) {
     } else {
         return detail::scalar::sized(first, end, key, comp, proj);
     }
+    }  // use_lex_subst
 }
 
 // Position form.  For the wide/expensive path keep `sized`'s sentinel fast
@@ -1355,6 +1561,15 @@ I sized_partition(I first, S last, K key, Comp comp = {}, Proj proj = {}) {
 template <std::random_access_iterator I, std::sentinel_for<I> S,
           class Comp = std::less<>, class Proj = std::identity>
 I sized_partition_at(I first, S last_s, I pivot, Comp comp = {}, Proj proj = {}) {
+    // Same pinned-comparator substitution as sized_partition (the key here
+    // is proj(*pivot) = the element type itself).
+    if constexpr (detail::net::use_lex_subst<I, std::iter_value_t<I>, Comp,
+                                             Proj> &&
+                  tuning::halve_mid_max == 0) {
+        return sized_partition_at(
+            first, last_s, pivot,
+            detail::net::subst_lex_comp_t<std::iter_value_t<I>>{}, proj);
+    } else {
     I last = first + (last_s - first);
     const auto n = last - first;
     if constexpr (tuning::halve_mid_max > 0) {
@@ -1375,6 +1590,7 @@ I sized_partition_at(I first, S last_s, I pivot, Comp comp = {}, Proj proj = {})
     } else {
         return detail::scalar::sized_at(first, last, pivot, comp, proj);
     }
+    }  // use_lex_subst
 }
 
 }  // namespace partitions
@@ -1752,8 +1968,853 @@ template <std::random_access_iterator It, class K, class Comp = std::less<>,
 std::ptrdiff_t offset_partition(It first, It last,
                                 std::iter_difference_t<It> offset, K key,
                                 Comp comp = {}, Proj proj = {}) {
-    return detail::offset::sized_off(first, last, offset, key, comp, proj) -
-           first;
+    // Pinned pair-lex scan comparator, exactly as in sized_partition.
+    if constexpr (detail::net::use_lex_subst<It, K, Comp, Proj>) {
+        return offset_partition(
+            first, last, offset, key,
+            detail::net::subst_lex_comp_t<std::iter_value_t<It>>{}, proj);
+    } else {
+        return detail::offset::sized_off(first, last, offset, key, comp,
+                                         proj) -
+               first;
+    }
+}
+
+}  // namespace partitions
+
+// ===========================================================================
+// detail::cyclic + cyclic_partition / cyclic_offset_partition -- the keyed
+// forward partition and the offset partition over a possibly-WRAPPED range of
+// a cyclic buffer [buf_begin, buf_end).
+//
+// RANGE CONVENTION.  The logical range is given by (first, last) inside the
+// buffer:
+//     first <= last : the ordinary contiguous [first, last)
+//     first >  last : the WRAPPED range  S1 ++ S2,
+//                     S1 = [first, buf_end),  S2 = [buf_begin, last)
+// first == last means EMPTY (the standard ring convention -- a full wrapped
+// buffer is not expressible; pass the flat [buf_begin, buf_end) instead).
+// Elements outside the logical range are never read or written.
+//
+// CONTRACT (logical view, identical to the flat entry points): on return,
+// logical positions [0, c) satisfy comp(proj(x), key) and [c, n) do not,
+// where c is the below-key count.  cyclic_partition returns the PHYSICAL
+// boundary iterator normalized into [buf_begin, buf_end) (logical index c;
+// when first + c lands exactly on buf_end it wraps to buf_begin);
+// cyclic_partition_count and cyclic_offset_partition return c itself.
+//
+// DESIGN (full idea log + measurements: cyclic_partitions.txt).  A wrapped
+// range is two contiguous segments, and partitions are not stable, so no
+// per-element wrap arithmetic is ever needed:
+//
+//   * gap_cyclic -- small-n tier.  The branchless Lomuto gap method run over
+//     the logical range: the gap cursor j is CHUNKED (flat over S1, one
+//     explicit wrap step, flat over S2 -- zero per-step wrap cost), and the
+//     data-dependent boundary cursor i, which cannot be chunked, advances by
+//     `pi += below; pi = pi == buf_end ? buf_begin : pi` -- a cmp+cmov, never
+//     a branch.  While j is still inside S1, i <= j keeps pi in S1 too, so
+//     chunk A carries NO wrap check at all.
+//
+//   * seg_bridge -- large-n tier.  Flat-partition S1 and S2 independently
+//     (each through sized_partition, so the AVX2 kernels are reused
+//     unchanged), then join with ONE swap_ranges "bridge": with layouts
+//     S1 = [b1|g1], S2 = [b2|g2], swapping min(|b2|, |g1|) elements makes the
+//     below groups logically contiguous -- if |b2| <= |g1| pull all of b2
+//     into the front of g1, else swap all of g1 with the LAST |g1| elements
+//     of b2 (disjoint).  Exactly n compares; the bridge is a vectorized
+//     optimal exchange bounded by min(len1, len2, c, n-c).
+//
+//   * cross_fill2 / seg_fill -- the offset-partition machinery generalized
+//     across the wrap.  prefix_fill's slot region and scan region never had
+//     to be contiguous with each other: after flat-partitioning S1, its >=
+//     tail g1 is a supply of all->= swap slots, and S2 is scanned from the
+//     RIGHT in branchless offset blocks, each found below rotated directly
+//     into the next slot (2 moves, moved exactly once -- no bridge
+//     double-handling).  cross_fill2 takes the slot supply as up to TWO
+//     contiguous runs so the cyclic offset partition's spilled prefix
+//     (S1 entirely >= plus a leading piece of S2) fits the same kernel:
+//     fill_slots is semantically a pairwise slot[i] <-> src[i] exchange, so
+//     splitting one block's rotation across the run boundary into two calls
+//     is legal.  On AVX2 the block scan uses vfill_right for eligible
+//     integer types.
+//
+// The pivot key is BY VALUE for the same aliasing reason as everywhere else
+// in this file.
+// ===========================================================================
+namespace partitions::detail::cyclic {
+
+// ---------------------------------------------------------------------------
+// wrap_hoare -- correctness reference ONLY (never dispatched): Hoare over
+// logical indices with a wrap check on every access.  This is the naive cost
+// model the real kernels are measured against.
+// ---------------------------------------------------------------------------
+template <std::random_access_iterator I, class K, class Comp, class Proj>
+inline std::iter_difference_t<I> wrap_hoare(I first, I last, I buf_begin,
+                                            I buf_end, K key, Comp comp,
+                                            Proj proj) {
+    using D = std::iter_difference_t<I>;
+    const D len1 = buf_end - first;
+    const D n = len1 + (last - buf_begin);
+    auto at = [&](D k) { return k < len1 ? first + k : buf_begin + (k - len1); };
+    auto below = [&](D k) {
+        return static_cast<bool>(
+            std::invoke(comp, std::invoke(proj, *at(k)), key));
+    };
+    D lo = 0, hi = n;
+    while (true) {
+        while (lo != hi && below(lo)) ++lo;
+        do {
+            if (lo == hi) return lo;
+            --hi;
+        } while (!below(hi));
+        std::iter_swap(at(lo), at(hi));
+        ++lo;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// gap_cyclic -- branchless Lomuto gap method over a WRAPPED range, with the
+// gap opened at logical `offset` (offset = 0 gives the plain partition; a
+// positive offset is the offset-partition form, exactly like gap_off).
+//
+// PRECONDITIONS: the range wraps (len1 >= 1, len2 >= 1) and offset < n.
+// Cost: (n - offset) compares + 2(n - offset) moves, p-flat; the only wrap
+// tax is one cmp+cmov per iteration on the boundary cursor -- and none at
+// all while the gap cursor is still in S1 (i <= j keeps pi in S1 there).
+// Returns the below-key count.
+//
+// LOOP-BODY SHAPE (load once, compare the REGISTER, then store).  The naive
+// transcription `*pj = move(*pi); *pi = move(pj[1]); i += below(pi);` makes
+// the predicate read back through *pi.  Whether GCC then keeps the value in
+// a register is a register-allocation lottery: in several instantiation
+// contexts (measured: the public dispatcher, and any standalone
+// instantiation, for pair<float,int>/pair<int,int>/pair<double,long>) the
+// setcc scratch register was allocated on top of a value RELOADED from *pi,
+// and the partial-register merge (`setnp al` into a register whose upper
+// bytes came from that load) put a store-to-load forward onto the
+// loop-carried dependency -- ~12 cycles/iteration instead of ~4 (2.6x,
+// p-independent, no extra branches; full forensics in cyclic_partitions.txt
+// round 2).  Naming the moved element `x` and comparing x BEFORE storing it
+// removes the memory round-trip from the predicate entirely, which pins the
+// fast shape in every context.
+// ---------------------------------------------------------------------------
+template <std::random_access_iterator I, class K, class Comp, class Proj>
+inline std::iter_difference_t<I> gap_cyclic(I first, I last, I buf_begin,
+                                            I buf_end,
+                                            std::iter_difference_t<I> offset,
+                                            K key, Comp comp, Proj proj) {
+    using D = std::iter_difference_t<I>;
+    using T = std::iter_value_t<I>;
+    const D len1 = buf_end - first;
+    auto below_v = [&](const T& v) {
+        return static_cast<bool>(
+            std::invoke(comp, std::invoke(proj, v), key));
+    };
+
+    I gap = offset < len1 ? first + offset : buf_begin + (offset - len1);
+    T tmp = std::move(*gap);
+    I pi = first;  // physical cursor of the boundary index i (starts at 0)
+
+    if (offset < len1) {
+        // Chunk A: j in [offset, len1-1) -- the gap and its successor both in
+        // S1, and i <= j < len1-1 keeps pi in S1: no wrap handling at all.
+        for (I pj = gap; pj != buf_end - 1; ++pj) {
+            *pj = std::move(*pi);
+            T x = std::move(pj[1]);
+            const bool b = below_v(x);
+            *pi = std::move(x);
+            pi += static_cast<D>(b);
+        }
+        // j = len1-1: the gap's successor is across the wrap (S2[0]); pi may
+        // step onto buf_end exactly here, normalize once.
+        *(buf_end - 1) = std::move(*pi);
+        {
+            T x = std::move(*buf_begin);
+            const bool b = below_v(x);
+            *pi = std::move(x);
+            pi += static_cast<D>(b);
+        }
+        pi = pi == buf_end ? buf_begin : pi;
+    }
+    // Chunk B: j in [max(offset, len1), n-1) -- flat over S2.  pi crosses the
+    // wrap AT MOST ONCE, so the crossing test must not ride the pointer
+    // dependency chain: while pi is still in S1 it is a predicted-not-taken
+    // BRANCH (a cmov here measured ~1.6 cycles/elem slower -- it serialises
+    // the pi chain; see cyclic_partitions.txt R1), and once pi has crossed
+    // the remaining iterations run with no test at all (pi <= j keeps it
+    // strictly inside S2 from then on).
+    I pj = offset < len1 ? buf_begin : gap;
+    if (pi >= first) {  // pi still in S1
+        for (; pj != last - 1; ++pj) {
+            *pj = std::move(*pi);
+            T x = std::move(pj[1]);
+            const bool b = below_v(x);
+            *pi = std::move(x);
+            pi += static_cast<D>(b);
+            if (pi == buf_end) {  // one-shot wrap
+                pi = buf_begin;
+                ++pj;
+                break;
+            }
+        }
+    }
+    for (; pj != last - 1; ++pj) {
+        *pj = std::move(*pi);
+        T x = std::move(pj[1]);
+        const bool b = below_v(x);
+        *pi = std::move(x);
+        pi += static_cast<D>(b);
+    }
+    // j = n-1: the lifted element comes home through the final gap.
+    *(last - 1) = std::move(*pi);
+    const bool btmp = below_v(tmp);
+    *pi = std::move(tmp);
+    const D i = pi >= first ? pi - first : len1 + (pi - buf_begin);
+    return i + static_cast<D>(btmp);
+}
+
+// ---------------------------------------------------------------------------
+// bridge -- join two independently partitioned segments with ONE swap_ranges.
+// PRECONDITION: [m1, s1_end) is all >= key and [s2_begin, m2) is all < key,
+// with segment 1 logically preceding segment 2.  Swaps k = min(m2 - s2_begin,
+// s1_end - m1) elements; both arms degenerate to empty swaps, so no special
+// cases.  (Proof of both arms: cyclic_partitions.txt section 3.)
+// ---------------------------------------------------------------------------
+template <class I>
+PARTITIONS_ALWAYS_INLINE void bridge(I m1, I s1_end, I s2_begin, I m2) {
+    const auto c2 = m2 - s2_begin;
+    const auto g1 = s1_end - m1;
+    if (c2 <= g1)
+        std::swap_ranges(s2_begin, m2, m1);   // all of b2 into the front of g1
+    else
+        std::swap_ranges(m1, s1_end, m2 - g1);  // all of g1 with b2's tail
+}
+
+// ---------------------------------------------------------------------------
+// seg_bridge -- flat-partition both segments (every measured flat kernel,
+// including the AVX2 compress/block_simd tiers, reused unchanged), then one
+// bridge.  Exactly n compares.  Returns the below-key count.
+// ---------------------------------------------------------------------------
+template <std::random_access_iterator I, class K, class Comp, class Proj>
+inline std::iter_difference_t<I> seg_bridge(I first, I last, I buf_begin,
+                                            I buf_end, K key, Comp comp,
+                                            Proj proj) {
+    I m1 = sized_partition(first, buf_end, key, comp, proj);
+    I m2 = sized_partition(buf_begin, last, key, comp, proj);
+    bridge(m1, buf_end, buf_begin, m2);
+    return (m1 - first) + (m2 - buf_begin);
+}
+
+// ---------------------------------------------------------------------------
+// cross_fill2 -- prefix_fill generalized across the wrap: move every
+// below-key element of the contiguous suffix [sfirst, slast) into the leading
+// SLOTS, where the slot supply is up to TWO contiguous all->= runs
+// [r1lo, r1end) then [r2lo, r2end), logically ordered runs-then-suffix.
+// Returns the number of below elements found in the suffix.
+//
+// Phase 1 scans the suffix from the RIGHT in branchless offset blocks
+// (unconditional byte write + setcc add, 8x unrolled; vfill_right on the AVX2
+// integer fast path) and rotates each block's belows into the next slots
+// (fill_slots: 2 moves per element, moved exactly once).  A block's belows
+// may straddle the run boundary: fill_slots is a pairwise slot[i] <-> src[i]
+// exchange, so it is split into two calls.  Phase 2 flat-partitions the
+// remaining suffix and bridges the below-run into the remaining slot runs
+// (<= 2 swap_ranges per arm; the min() split keeps filled slots a LEADING
+// logical run in both arms).  With no slots at all this degenerates to a
+// plain flat partition of the suffix.
+// ---------------------------------------------------------------------------
+template <std::random_access_iterator I, class K, class Comp, class Proj>
+inline std::iter_difference_t<I> cross_fill2(I r1lo, I r1end, I r2lo, I r2end,
+                                             I sfirst, I slast, K key,
+                                             Comp comp, Proj proj) {
+    using D = std::iter_difference_t<I>;
+    constexpr D B = static_cast<D>(tuning::block_size);
+    auto below = [&](I it) {
+        return static_cast<bool>(
+            std::invoke(comp, std::invoke(proj, *it), key));
+    };
+#if defined(__AVX2__)
+    using T = std::iter_value_t<I>;
+    constexpr bool kSimd =
+        std::contiguous_iterator<I> && avx2::simd_eligible<T, Comp, Proj>;
+#else
+    constexpr bool kSimd = false;
+#endif
+
+    alignas(tuning::cacheline_bytes)
+        unsigned char offsets_r_storage[tuning::block_size +
+                                        tuning::cacheline_bytes];
+    unsigned char* offsets_r = scalar::align_cacheline(offsets_r_storage);
+
+    I lo = r1lo, lo_end = r1end;
+    if (lo == lo_end) {  // run 1 empty: consume run 2 as the current run
+        lo = r2lo;
+        lo_end = r2end;
+        r2lo = r2end;
+    }
+    D slots_rem = (lo_end - lo) + (r2end - r2lo);
+    D found = 0;
+
+    // Phase 1: whole right blocks while a full block's belows always fit.
+    while (slots_rem >= B && slast - sfirst >= B) {
+        std::size_t num_r = 0;
+        if constexpr (kSimd) {
+#if defined(__AVX2__)
+            avx2::vfill_right<T>(std::to_address(slast), key, offsets_r, num_r,
+                                 tuning::block_size);
+            slast -= B;
+#endif
+        } else {
+            for (std::size_t i = 0; i < tuning::block_size;) {
+                offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += below(--slast);
+                offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += below(--slast);
+                offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += below(--slast);
+                offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += below(--slast);
+                offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += below(--slast);
+                offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += below(--slast);
+                offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += below(--slast);
+                offsets_r[num_r] = static_cast<unsigned char>(++i); num_r += below(--slast);
+            }
+        }
+        const D rem = static_cast<D>(num_r);
+        const D run1_room = lo_end - lo;
+        const D k1 = rem < run1_room ? rem : run1_room;
+        offset::fill_slots(lo, slast + B, offsets_r,
+                           static_cast<std::size_t>(k1));
+        lo += k1;
+        if (lo == lo_end) {  // run exhausted exactly: switch to run 2
+            lo = r2lo;
+            lo_end = r2end;
+            r2lo = r2end;
+        }
+        if (k1 < rem) {  // block straddled the run boundary: finish in run 2
+            offset::fill_slots(lo, slast + B, offsets_r + k1,
+                               static_cast<std::size_t>(rem - k1));
+            lo += rem - k1;
+        }
+        slots_rem -= rem;
+        found += rem;
+    }
+
+    // Phase 2: flat-partition the remaining suffix, bridge into the <= 2
+    // remaining slot runs.
+    I m = sized_partition(sfirst, slast, key, comp, proj);
+    const D c_rem = m - sfirst;
+    const D s1r = lo_end - lo;
+    const D s2r = r2end - r2lo;
+    if (c_rem <= s1r + s2r) {
+        // The whole below-run fits the slots: fill them LEADING-first.
+        const D k1 = c_rem < s1r ? c_rem : s1r;
+        std::swap_ranges(sfirst, sfirst + k1, lo);
+        std::swap_ranges(sfirst + k1, m, r2lo);
+    } else {
+        // Fill ALL remaining slots from the TAIL of the below-run (disjoint:
+        // the slot runs never overlap the suffix).
+        I t = m - (s1r + s2r);
+        std::swap_ranges(lo, lo_end, t);
+        std::swap_ranges(r2lo, r2end, t + s1r);
+    }
+    return found + c_rem;
+}
+
+// ---------------------------------------------------------------------------
+// seg_fill -- the fused plain cyclic partition: flat-partition S1, then treat
+// its >= tail as the slot run and cross-fill S2's belows straight into it.
+// Each S2 below is moved once (no bridge double-handling).
+// ---------------------------------------------------------------------------
+template <std::random_access_iterator I, class K, class Comp, class Proj>
+inline std::iter_difference_t<I> seg_fill(I first, I last, I buf_begin,
+                                          I buf_end, K key, Comp comp,
+                                          Proj proj) {
+    I m1 = sized_partition(first, buf_end, key, comp, proj);
+    return (m1 - first) + cross_fill2(m1, buf_end, buf_end, buf_end, buf_begin,
+                                      last, key, comp, proj);
+}
+
+// ---------------------------------------------------------------------------
+// Wrapped offset-partition kernels.  W1: the >= prefix ends inside S1 --
+// flat-offset-partition S1 (its own prefix logic), then S2's belows go into
+// S1's >= tail.  W2: the prefix spills into S2 (S1 is ENTIRELY prefix, pure
+// swap targets, never compared) -- the slot supply is S1 plus S2's leading
+// prefix piece, i.e. cross_fill2's two runs.  Each has a seg (partition +
+// bridge) and a fused (cross_fill2) variant; the dispatcher picks the
+// measured winner.
+// ---------------------------------------------------------------------------
+template <std::random_access_iterator I, class K, class Comp, class Proj>
+inline std::iter_difference_t<I> off_w1_fill(I first, I last, I buf_begin,
+                                             I buf_end,
+                                             std::iter_difference_t<I> offset,
+                                             K key, Comp comp, Proj proj) {
+    I m1 = offset::sized_off(first, buf_end, offset, key, comp, proj);
+    return (m1 - first) + cross_fill2(m1, buf_end, buf_end, buf_end, buf_begin,
+                                      last, key, comp, proj);
+}
+
+template <std::random_access_iterator I, class K, class Comp, class Proj>
+inline std::iter_difference_t<I> off_w1_seg(I first, I last, I buf_begin,
+                                            I buf_end,
+                                            std::iter_difference_t<I> offset,
+                                            K key, Comp comp, Proj proj) {
+    I m1 = offset::sized_off(first, buf_end, offset, key, comp, proj);
+    I m2 = sized_partition(buf_begin, last, key, comp, proj);
+    bridge(m1, buf_end, buf_begin, m2);
+    return (m1 - first) + (m2 - buf_begin);
+}
+
+template <std::random_access_iterator I, class K, class Comp, class Proj>
+inline std::iter_difference_t<I> off_w2_fill(I first, I last, I buf_begin,
+                                             I buf_end,
+                                             std::iter_difference_t<I> offset,
+                                             K key, Comp comp, Proj proj) {
+    I p = buf_begin + (offset - (buf_end - first));
+    return cross_fill2(first, buf_end, buf_begin, p, p, last, key, comp, proj);
+}
+
+template <std::random_access_iterator I, class K, class Comp, class Proj>
+inline std::iter_difference_t<I> off_w2_seg(I first, I last, I buf_begin,
+                                            I buf_end,
+                                            std::iter_difference_t<I> offset,
+                                            K key, Comp comp, Proj proj) {
+    I m2 = offset::sized_off(buf_begin, last, offset - (buf_end - first), key,
+                             comp, proj);
+    bridge(first, buf_end, buf_begin, m2);  // "g1" := all of S1 (pure prefix)
+    return m2 - buf_begin;
+}
+
+// The comparator class the cyclic gates key on: a pair-like element compared
+// with the default `<` is a short-circuit LEX compare (a data-dependent
+// branch per element in every scan); everything else on the focus list is a
+// branchless single compare.
+template <class T, class Comp, class Proj>
+inline constexpr bool cyclic_lexish =
+    net::lex_pair_like<T> && net::is_default_less<Comp, Proj>;
+
+// The pair-lex scan comparators and the substitution machinery live in
+// detail::net (they now also serve the FLAT entry points, which are defined
+// before this section); re-exported here for the cyclic dispatchers and for
+// existing external references.
+using net::lex_less_branchless;
+using net::lex_less_packed;
+using net::lex_less_semibranch;
+using net::subst_lex_comp_t;
+template <class It, class K, class Comp, class Proj>
+inline constexpr bool use_branchless_lex = net::use_lex_subst<It, K, Comp, Proj>;
+
+}  // namespace partitions::detail::cyclic
+
+namespace partitions {
+
+// Below-key count form of the cyclic partition (see the section header for
+// the range convention and contract).  The count is what the kernels compute
+// natively; the iterator form is derived from it.
+template <std::random_access_iterator It, class K, class Comp = std::less<>,
+          class Proj = std::identity>
+std::iter_difference_t<It> cyclic_partition_count(It first, It last,
+                                                  It buf_begin, It buf_end,
+                                                  K key, Comp comp = {},
+                                                  Proj proj = {}) {
+    using D = std::iter_difference_t<It>;
+    // Pair-lex under the default `<`: swap in the branchless lex comparator
+    // (identical order, no data-dependent branch) and re-dispatch -- the
+    // substituted type then flows through every internal kernel.
+    if constexpr (detail::cyclic::use_branchless_lex<It, K, Comp, Proj>) {
+        return cyclic_partition_count(
+            first, last, buf_begin, buf_end, key,
+            detail::cyclic::subst_lex_comp_t<std::iter_value_t<It>>{}, proj);
+    } else {
+    if (first <= last)  // flat (includes empty)
+        return sized_partition(first, last, key, comp, proj) - first;
+    if (last == buf_begin)  // wrapped notation, but S2 is empty
+        return sized_partition(first, buf_end, key, comp, proj) - first;
+    const D n = (buf_end - first) + (last - buf_begin);
+    if constexpr (detail::cyclic::cyclic_lexish<std::iter_value_t<It>, Comp,
+                                                Proj>) {
+        if (n <= tuning::cyclic_gap_max_lex)
+            return detail::cyclic::gap_cyclic(first, last, buf_begin, buf_end,
+                                              D{0}, key, comp, proj);
+        // Branchy-compare pairs: the vectorised bridge beats the fused
+        // fill's scattered rotation at every measured mid wrap.
+        return detail::cyclic::seg_bridge(first, last, buf_begin, buf_end, key,
+                                          comp, proj);
+    } else if constexpr (std::is_same_v<Comp,
+                                        detail::cyclic::lex_less_branchless>) {
+        // Multi-setcc lex predicate: tiny gap tier (its loop codegen is
+        // context-fragile -- see tuning::cyclic_gap_max_mlex), bridge through
+        // mid sizes, fused fill above.
+        if (n <= tuning::cyclic_gap_max_mlex)
+            return detail::cyclic::gap_cyclic(first, last, buf_begin, buf_end,
+                                              D{0}, key, comp, proj);
+        if (n <= tuning::cyclic_bridge_max_mlex)
+            return detail::cyclic::seg_bridge(first, last, buf_begin, buf_end,
+                                              key, comp, proj);
+        return detail::cyclic::seg_fill(first, last, buf_begin, buf_end, key,
+                                        comp, proj);
+    } else {
+        constexpr D gap_max = detail::simd_fast_path<It, Comp, Proj>
+                                  ? tuning::cyclic_gap_max_simd
+                                  : tuning::cyclic_gap_max;
+        if (n <= gap_max)
+            return detail::cyclic::gap_cyclic(first, last, buf_begin, buf_end,
+                                              D{0}, key, comp, proj);
+        // Cheap-compare elements (incl. the AVX2 integer fast path): the
+        // fused fill moves each S2 below exactly once.
+        return detail::cyclic::seg_fill(first, last, buf_begin, buf_end, key,
+                                        comp, proj);
+    }
+    }  // use_branchless_lex
+}
+
+// Physical boundary iterator, normalized into [buf_begin, buf_end).
+template <std::random_access_iterator It, class K, class Comp = std::less<>,
+          class Proj = std::identity>
+It cyclic_partition(It first, It last, It buf_begin, It buf_end, K key,
+                    Comp comp = {}, Proj proj = {}) {
+    const auto c =
+        cyclic_partition_count(first, last, buf_begin, buf_end, key, comp, proj);
+    if (first <= last) return first + c;
+    const auto len1 = buf_end - first;
+    return c < len1 ? first + c : buf_begin + (c - len1);
+}
+
+// Cyclic offset partition: PRECONDITION that the logical prefix [0, offset)
+// is all >= key (never compared, only swapped into).  Returns the below-key
+// count c; on return logical [0, c) is all < key, [c, n) all >= key.
+template <std::random_access_iterator It, class K, class Comp = std::less<>,
+          class Proj = std::identity>
+std::iter_difference_t<It> cyclic_offset_partition(
+    It first, It last, It buf_begin, It buf_end,
+    std::iter_difference_t<It> offset, K key, Comp comp = {}, Proj proj = {}) {
+    using D = std::iter_difference_t<It>;
+    // Pair-lex under the default `<`: branchless-comparator substitution,
+    // exactly as in cyclic_partition_count.
+    if constexpr (detail::cyclic::use_branchless_lex<It, K, Comp, Proj>) {
+        return cyclic_offset_partition(
+            first, last, buf_begin, buf_end, offset, key,
+            detail::cyclic::subst_lex_comp_t<std::iter_value_t<It>>{}, proj);
+    } else {
+    if (first <= last)
+        return detail::offset::sized_off(first, last, offset, key, comp, proj) -
+               first;
+    if (last == buf_begin)
+        return detail::offset::sized_off(first, buf_end, offset, key, comp,
+                                         proj) -
+               first;
+    const D len1 = buf_end - first;
+    const D n = len1 + (last - buf_begin);
+    const D suffix = n - offset;
+    if (suffix <= 0) return 0;  // empty suffix: no below elements exist
+    // NOTE: the flat dispatcher's "narrow T && offset >= suffix -> gap" rule
+    // does NOT carry over: the cyclic fill scans with vfill_right on the AVX2
+    // fast path and beat the gap walk 2-3x in exactly that regime (measured;
+    // cyclic_partitions.txt).  The only gap tier left is a small SUFFIX.
+    if constexpr (detail::cyclic::cyclic_lexish<std::iter_value_t<It>, Comp,
+                                                Proj>) {
+        if (suffix <= tuning::cyclic_off_gap_max_lex)
+            return detail::cyclic::gap_cyclic(first, last, buf_begin, buf_end,
+                                              offset, key, comp, proj);
+        // Branchy-compare pairs: partition + bridge wins while the prefix
+        // ends inside S1; once the prefix spills into S2 the two-run fused
+        // fill wins (W1 -> seg, W2 -> fill: regret 0.5% vs 9% for either
+        // kernel alone).
+        if (offset <= len1)
+            return detail::cyclic::off_w1_seg(first, last, buf_begin, buf_end,
+                                              offset, key, comp, proj);
+        return detail::cyclic::off_w2_fill(first, last, buf_begin, buf_end,
+                                           offset, key, comp, proj);
+    } else {
+        // The lex comparators gate at 256 (measured: the 16-byte gap walk's
+        // two wide moves per suffix element lose to the fill's once-moved
+        // rotation earlier than for first-projection keys).
+        constexpr D gap_max =
+            std::is_same_v<Comp, detail::cyclic::lex_less_branchless> ||
+                    std::is_same_v<Comp, detail::net::lex_less_semibranch>
+                ? tuning::cyclic_off_gap_max_mlex
+                : detail::simd_fast_path<It, Comp, Proj>
+                      ? tuning::cyclic_off_gap_max_simd
+                      : tuning::cyclic_off_gap_max;
+        if (suffix <= gap_max)
+            return detail::cyclic::gap_cyclic(first, last, buf_begin, buf_end,
+                                              offset, key, comp, proj);
+        if (offset <= len1)
+            return detail::cyclic::off_w1_fill(first, last, buf_begin, buf_end,
+                                               offset, key, comp, proj);
+        return detail::cyclic::off_w2_fill(first, last, buf_begin, buf_end,
+                                           offset, key, comp, proj);
+    }
+    }  // use_branchless_lex
+}
+
+}  // namespace partitions
+
+// ===========================================================================
+// detail::minsel + find_min / cyclic_find_min -- find a minimal element of a
+// flat or possibly-WRAPPED range (range convention as in cyclic_partition).
+//
+// Adapted from the source repo's measured find-minimum study
+// (quicksort_lr.hpp detail::find_min + docs/quicksort_lr.md); every design
+// choice below is that study's, re-verified here:
+//
+//   * The best kernel is PROJECTED-KEY-WIDTH dependent.  Narrow keys
+//     (register-width scalars) update the running minimum with the BRANCHY
+//     source form `if (comp(k, best)) { best = k; pos = it; }` -- GCC lowers
+//     it to ONE cmp + two cmovs (value + position); the double-ternary
+//     "branchless" form wastes a second compare.  Wide keys (16-byte lex
+//     pairs) keep the same source form as a REAL branch: a running-minimum
+//     update fires with probability ~1/i, the branch predicts almost
+//     perfectly, and the 16-byte copy runs only on genuine updates --
+//     forcing a per-element blend is 2-3x slower (kept negative result).
+//   * TWO independent accumulators (the even/odd "double scan") break the
+//     cmp -> cmov(best) -> cmp carried chain and win from n ~ 16 UP; below
+//     that the single accumulator's zero setup wins (and >= 4 accumulators
+//     or tournament networks always lose -- kept negative results).
+//   * Lex pairs re-use the round-3 comparator playbook: 4+4-byte integer
+//     pairs are scanned as PACKED u64 keys (pack once per element -- the key
+//     becomes narrow-class and the whole scan is branchless); other lex
+//     pairs run the wide kernel under lex_less_semibranch (the pinned
+//     short-circuit the wide kernel's rationale depends on).
+//
+// CYCLIC DESIGN.  A minimum is order-independent, so a wrapped range costs
+// NOTHING extra by construction: the running (best, pos) state simply
+// continues through two back-to-back flat segment loops -- no wrap check in
+// any loop body, no second initialisation, no combine step (M1).  The
+// two-accumulator large tier (M2) carries both lanes across the wrap the
+// same way (lane parity is not global; each segment drains its odd tail
+// into lane 0).  TIE RULE: some minimal element is returned (the source
+// study's contract, not std::min_element's first-occurrence -- the lanes of
+// the double scan already forfeit that); on tie-free data flat and wrapped
+// agree.  find_min requires n >= 1; cyclic_find_min returns `first` for the
+// empty (first == last) range.
+// ===========================================================================
+namespace partitions::detail::minsel {
+
+// dst = c ? src : dst, forced through general-purpose registers where a
+// naive conditional copy would leave the value in XMM and become a branch
+// (float/double keys), or through a two-word XOR blend for 16-byte keys.
+template <class K>
+PARTITIONS_ALWAYS_INLINE void cond_assign(K& dst, const K& src, bool c) {
+    if constexpr (std::is_trivially_copyable_v<K> && sizeof(K) == 16) {
+        struct two_words { std::uint64_t a, b; };
+        auto d = std::bit_cast<two_words>(dst);
+        const auto s = std::bit_cast<two_words>(src);
+        const std::uint64_t mask = 0ull - static_cast<std::uint64_t>(c);
+        d.a ^= (d.a ^ s.a) & mask;
+        d.b ^= (d.b ^ s.b) & mask;
+        dst = std::bit_cast<K>(d);
+    } else if constexpr (std::is_trivially_copyable_v<K> && sizeof(K) == 8 &&
+                         !std::is_integral_v<K>) {
+        auto d = std::bit_cast<std::uint64_t>(dst);
+        const auto s = std::bit_cast<std::uint64_t>(src);
+        const std::uint64_t mask = 0ull - static_cast<std::uint64_t>(c);
+        d ^= (d ^ s) & mask;
+        dst = std::bit_cast<K>(d);
+    } else if constexpr (std::is_trivially_copyable_v<K> && sizeof(K) == 4 &&
+                         !std::is_integral_v<K>) {
+        auto d = std::bit_cast<std::uint32_t>(dst);
+        const auto s = std::bit_cast<std::uint32_t>(src);
+        const std::uint32_t mask = 0u - static_cast<std::uint32_t>(c);
+        d ^= (d ^ s) & mask;
+        dst = std::bit_cast<K>(d);
+    } else {
+        dst = c ? src : dst;  // CMOV for register-width integrals
+    }
+}
+
+// Continue a running minimum (best, pos) through the flat segment
+// [first, last).  One source form serves both key classes: narrow keys
+// if-convert to cmp + 2 cmov, wide keys keep the rarely-taken branch.
+template <class It, class K, class Comp, class Proj>
+PARTITIONS_ALWAYS_INLINE void scan1(It first, It last, K& best, It& pos,
+                                    Comp& comp, Proj& proj) {
+    for (It it = first; it != last; ++it) {
+        K k = std::invoke(proj, *it);
+        if (static_cast<bool>(std::invoke(comp, k, best))) {
+            best = k;
+            pos = it;
+        }
+    }
+}
+
+// Continue TWO lanes through [first, last); the odd tail drains into lane 0.
+template <class It, class K, class Comp, class Proj>
+PARTITIONS_ALWAYS_INLINE void scan2(It first, It last, K& b0, It& p0, K& b1,
+                                    It& p1, Comp& comp, Proj& proj) {
+    using D = std::iter_difference_t<It>;
+    It pair_end = first + ((last - first) & ~D{1});
+    It it = first;
+    for (; it != pair_end; it += 2) {
+        K k0 = std::invoke(proj, it[0]);
+        K k1 = std::invoke(proj, it[1]);
+        if (static_cast<bool>(std::invoke(comp, k0, b0))) {
+            b0 = k0;
+            p0 = it;
+        }
+        if (static_cast<bool>(std::invoke(comp, k1, b1))) {
+            b1 = k1;
+            p1 = it + 1;
+        }
+    }
+    if (it != last) {
+        K k = std::invoke(proj, *it);
+        if (static_cast<bool>(std::invoke(comp, k, b0))) {
+            b0 = k;
+            p0 = it;
+        }
+    }
+}
+
+template <class K>
+inline constexpr bool narrow_key = std::is_arithmetic_v<K> && sizeof(K) <= 8;
+
+// Projection composing the packed-u64 lex image (turns a 4+4-byte integer
+// pair scan into a narrow-class u64 scan).
+struct pack_proj {
+    template <class P>
+    PARTITIONS_ALWAYS_INLINE std::uint64_t operator()(const P& p) const {
+        return net::lex_less_packed::pack(p);
+    }
+};
+
+// Below this length the single accumulator's zero setup beats the double
+// scan (the source study's L ~ 16 crossover; re-measured in
+// cyclic_partitions.txt round 4).
+inline constexpr std::ptrdiff_t two_acc_min = 16;
+
+// WIDE keys also profit from two lanes -- with the BRANCHY update in each
+// lane (two independent rarely-taken branches pipeline fine; it is the
+// branchless per-element blend that the source study rejected).  The
+// crossover is member-dependent (measured, round 4): float-first pairs pay
+// ~1.9 ns/elem in one lane and cross at ~24; integer 16-byte pairs cross
+// only at ~256.
+template <class K>
+inline constexpr std::ptrdiff_t wide_two_acc_min = [] {
+    if constexpr (net::lex_pair_like<K>) {
+        if constexpr (std::is_floating_point_v<std::remove_reference_t<
+                          decltype(std::declval<K&>().first)>>)
+            return 24;
+        else
+            return 256;
+    } else {
+        return 256;
+    }
+}();
+
+// Flat kernel, class-dispatched.  Requires n >= 1.
+template <class It, class Comp, class Proj>
+PARTITIONS_ALWAYS_INLINE It find_min_flat(It first, It last, Comp comp,
+                                          Proj proj) {
+    using K = std::remove_cvref_t<decltype(std::invoke(proj, *first))>;
+    constexpr std::ptrdiff_t two_min =
+        narrow_key<K> ? two_acc_min : wide_two_acc_min<K>;
+    if (last - first >= two_min) {
+        K b0 = std::invoke(proj, first[0]);
+        K b1 = std::invoke(proj, first[1]);
+        It p0 = first, p1 = first + 1;
+        scan2(first + 2, last, b0, p0, b1, p1, comp, proj);
+        return static_cast<bool>(std::invoke(comp, b1, b0)) ? p1 : p0;
+    }
+    K best = std::invoke(proj, *first);
+    It pos = first;
+    scan1(first + 1, last, best, pos, comp, proj);
+    return pos;
+}
+
+// Wrapped kernel: three tiers, all measured (cyclic_partitions.txt round 4).
+//   n <  seg_ilp_max : PER-SEGMENT scans + one combine (M3).  Two
+//                      independent (best, pos) chains let the two segment
+//                      scans overlap in the out-of-order window -- measured
+//                      10-25% faster than the single carried chain below
+//                      n ~ 14 (a segment-level "double scan").
+//   narrow, larger   : unified TWO-accumulator lanes carried across the
+//                      wrap (M2).
+//   wide, larger     : unified single accumulator, branchy update (M1).
+// Requires a genuinely wrapped range (len1 >= 1, len2 >= 1).
+inline constexpr std::ptrdiff_t seg_ilp_max = 14;
+
+template <class It, class Comp, class Proj>
+PARTITIONS_ALWAYS_INLINE It find_min_cyc(It first, It last, It buf_begin,
+                                         It buf_end, Comp comp, Proj proj) {
+    using K = std::remove_cvref_t<decltype(std::invoke(proj, *first))>;
+    const auto n = (buf_end - first) + (last - buf_begin);
+    if (n < seg_ilp_max) {
+        It m1 = find_min_flat(first, buf_end, comp, proj);
+        It m2 = find_min_flat(buf_begin, last, comp, proj);
+        return static_cast<bool>(std::invoke(comp, std::invoke(proj, *m2),
+                                             std::invoke(proj, *m1)))
+                   ? m2
+                   : m1;
+    }
+    constexpr std::ptrdiff_t two_min =
+        narrow_key<K> ? two_acc_min : wide_two_acc_min<K>;
+    if (n >= two_min) {
+        K b0 = std::invoke(proj, *first);
+        K b1 = b0;
+        It p0 = first, p1 = first;
+        scan2(first + 1, buf_end, b0, p0, b1, p1, comp, proj);
+        scan2(buf_begin, last, b0, p0, b1, p1, comp, proj);
+        return static_cast<bool>(std::invoke(comp, b1, b0)) ? p1 : p0;
+    }
+    K best = std::invoke(proj, *first);
+    It pos = first;
+    scan1(first + 1, buf_end, best, pos, comp, proj);
+    scan1(buf_begin, last, best, pos, comp, proj);
+    return pos;
+}
+
+// COMPARATOR POLICY for min scans (P-C: yet another compare class).  A
+// running-minimum compare is element-vs-RUNNING-BEST and fires ~1/i of the
+// time, so the raw short-circuiting operator< is already optimal here (the
+// source study's wide-kernel rationale) -- measured in round 4:
+// substituting lex_less_semibranch made float-pair scans ~2-3x slower per
+// call while std::min_element with the raw compare stayed fast, so unlike
+// the partition entries NO semibranch substitution happens.  The ONLY
+// rewrite kept is the packed-u64 image for 4+4-byte integer pairs, which
+// turns the whole scan narrow-class (branchless cmp+cmov) and wins from
+// n ~ 16 while tying below.
+template <class It, class Comp, class Proj>
+inline constexpr bool use_packed_min =
+    net::int_pair_packable<std::iter_value_t<It>> &&
+    (std::is_same_v<Comp, std::less<>> ||
+     std::is_same_v<Comp, std::less<std::iter_value_t<It>>>) &&
+    std::is_same_v<Proj, std::identity>;
+
+}  // namespace partitions::detail::minsel
+
+namespace partitions {
+
+// Flat find-minimum: an iterator to A minimal element of [first, last)
+// under (comp, proj).  Requires last - first >= 1.
+template <std::random_access_iterator It, class Comp = std::less<>,
+          class Proj = std::identity>
+It find_min(It first, It last, Comp comp = {}, Proj proj = {}) {
+    if constexpr (detail::minsel::use_packed_min<It, Comp, Proj>) {
+        return detail::minsel::find_min_flat(first, last, std::less<>{},
+                                             detail::minsel::pack_proj{});
+    } else {
+        return detail::minsel::find_min_flat(first, last, comp, proj);
+    }
+}
+
+// Cyclic find-minimum (range convention as cyclic_partition: first > last
+// wraps as [first, buf_end) ++ [buf_begin, last); first == last is empty and
+// returns first).  Returns a PHYSICAL iterator to A minimal element.
+template <std::random_access_iterator It, class Comp = std::less<>,
+          class Proj = std::identity>
+It cyclic_find_min(It first, It last, It buf_begin, It buf_end,
+                   Comp comp = {}, Proj proj = {}) {
+    if (first <= last) {  // flat (includes empty)
+        if (first == last) return first;
+        return find_min(first, last, comp, proj);
+    }
+    if (last == buf_begin)  // wrapped notation, S2 empty
+        return find_min(first, buf_end, comp, proj);
+    if constexpr (detail::minsel::use_packed_min<It, Comp, Proj>) {
+        return detail::minsel::find_min_cyc(first, last, buf_begin, buf_end,
+                                            std::less<>{},
+                                            detail::minsel::pack_proj{});
+    } else {
+        return detail::minsel::find_min_cyc(first, last, buf_begin, buf_end,
+                                            comp, proj);
+    }
 }
 
 }  // namespace partitions

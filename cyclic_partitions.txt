@@ -1,0 +1,1076 @@
+================================================================================
+CYCLIC (RING-BUFFER) PARTITION + OFFSET PARTITION -- DESIGN / IDEA LOG
+================================================================================
+Target file: refactored_partitions.hpp (extend; self-contained, C++20, no deps).
+Machine for measurement: Intel Core Ultra 7 165H (Meteor Lake, AVX2, no AVX512),
+GCC 15.2, -O3 -march=native.  NOTE: tuning constants in the header were measured
+on Zen 3; this file's new measurements are Meteor Lake P-core (taskset-pinned).
+
+--------------------------------------------------------------------------------
+1. PROBLEM STATEMENT
+--------------------------------------------------------------------------------
+A cyclic buffer [buf_begin, buf_end).  A logical range (first, last) inside it
+that MAY WRAP: if first <= last it is the ordinary [first, last); if first >
+last it is [first, buf_end) ++ [buf_begin, last).  Extend the header with:
+
+  * cyclic_partition(first, last, buf_begin, buf_end, key, comp, proj)
+      -> physical boundary iterator (contract below)
+  * cyclic_offset_partition(first, last, buf_begin, buf_end, offset, key, ...)
+      -> count of below-key elements (mirrors flat offset_partition)
+      PRECONDITION: the logical prefix [0, offset) is all >= key.
+
+Contract (logical view, identical to the flat functions):
+    logical [0, c)  : comp(proj(x), key) true   (strictly below)
+    logical [c, n)  : false                     (>= key)
+Elements OUTSIDE the logical range (the buffer gap [last, first)) must not be
+touched, read or written (a real ring buffer owns live data there... actually
+the gap is the FREE area, but "do not touch" is the only safe contract; also
+never read it: it may be uninitialized => reading would be UB for non-trivial
+types and a correctness landmine).
+
+Extreme performance is the ONLY criterion.  No iterator wrappers, no per-access
+modular arithmetic in hot loops.  Focus types: int32_t, int64_t,
+pair<i32,i32>, pair<i64,i64>, with (a) lexicographic less and (b)
+first-coordinate-only less.
+
+--------------------------------------------------------------------------------
+2. API / SEMANTICS DECISIONS
+--------------------------------------------------------------------------------
+D1. Wrapped-ness is decided by pointer order: wrapped iff last < first.
+    Consequence: first == last means EMPTY, and a full-buffer range is NOT
+    expressible (standard ring convention, n <= cap-1 when wrapped; the
+    n == cap flat case [buf_begin, buf_end) is still expressible).  This gives
+    a branch-free size formula only per call (one predictable branch), which is
+    irrelevant at call granularity.
+D2. Requirements: buf_begin <= first < buf_end (for nonempty), buf_begin <=
+    last <= buf_end.  last == buf_end is legal in the flat case only.
+D3. Return value of cyclic_partition: the PHYSICAL iterator of the logical
+    boundary, normalized into [buf_begin, buf_end): m = first + c if that is
+    < buf_end (or if the range is flat), else buf_begin + (c - len1).  When
+    c == len1 exactly, first + c == buf_end normalizes to buf_begin.  The
+    caller can recover c as (m >= first ? m - first : (buf_end - first) +
+    (m - buf_begin)) -- also provide cyclic_partition_count returning c
+    directly (zero-cost: the kernels compute c natively; the iterator form is
+    derived FROM the count, not vice versa).
+D4. cyclic_offset_partition returns the count c (ptrdiff_t), exactly like the
+    flat offset_partition.  offset in [0, n].
+D5. Only random_access (segments) is required; the AVX2 tiers additionally
+    require contiguous_iterator exactly as the flat paths do.  Pointers are the
+    expected case.
+D6. Key by value (same reasoning as the file header: reference key reloads
+    every compare).
+
+--------------------------------------------------------------------------------
+3. CORE INSIGHT
+--------------------------------------------------------------------------------
+A wrapped range is exactly TWO contiguous segments:
+    S1 = [first, buf_end), len1        S2 = [buf_begin, last), len2
+Logical order is S1 then S2.  Every candidate below exploits this; the enemy is
+per-element wrap arithmetic (index mod cap, or ptr==buf_end checks in an inner
+loop), which either adds a data-independent-but-real cmp+cmov to the dependent
+address chain or, worse, a branch.
+
+After flat-partitioning both segments the physical layout is
+    S1 = [b1 | g1]   S2 = [b2 | g2]      (b = below, g = >= , c1=|b1|, c2=|b2|)
+logical = b1 g1 b2 g2, wanted = b1 b2' g1' g2.  Because partitions are NOT
+stable, fixing this does NOT need a rotate: ONE swap_ranges of
+k = min(c2, g1) elements suffices ("the bridge"):
+
+    if (c2 <= g1)  swap_ranges(buf_begin, buf_begin+c2, first+c1)
+        -- pull all of b2 into the front of g1.  Result: S1=[b1 b2 g...],
+           S2=[g... g2].  All belows logically first.  QED case 1.
+    else           swap_ranges(first+c1, buf_end, buf_begin + (c2 - g1))
+        -- swap ALL of g1 with the LAST g1 elements of b2 (disjoint since
+           c2 > g1).  Result: S1 all below; S2=[c2-g1 belows | g...].
+           Logical: len1 belows then (c2-g1) belows then all >=.  QED case 2.
+    Both arms degenerate to empty swaps when k == 0; no special cases.
+
+The bridge is 1 load + 1 store per element on both sides when vectorized
+(swap_ranges lowers to vmovdqu pairs) -- optimal exchange, and k is bounded by
+min(len1, len2, c, n-c).  When the wrap point is near either end of the logical
+range the bridge is tiny.  Worst case (mid wrap, p=0.5): k ~ n/4.
+
+--------------------------------------------------------------------------------
+4. CANDIDATE ALGORITHMS (plain cyclic partition)
+--------------------------------------------------------------------------------
+C0. wrap_hoare -- two converging cursors with an explicit wrap branch per step.
+    Purpose: CORRECTNESS REFERENCE ONLY (simplest possible implementation to
+    test the others against, along with a copy-out/std-partition oracle).
+    Never dispatched; per-element wrap check + mispredicting compare branch.
+
+C1. seg_bridge -- sized_partition(S1); sized_partition(S2); one bridge swap.
+    + Reuses EVERY measured flat kernel unchanged, including the AVX2
+      compress partition (i32/i64) and block_simd: for integer keys this is
+      near-unbeatable while L2-resident because compress is the fastest thing
+      in the file and swap_ranges is a vectorized optimal exchange.
+    + Exactly n compares (optimal).  Code is ~10 lines.
+    - Belows of S2 (up to k of them) are moved twice: once inside S2's
+      partition, once by the bridge.  Extra cost ~ k*(1 load + 1 store) * 2
+      sides.
+    Expected winner for i32/i64 mid/large n.  MEASURE.
+
+C2. fused cross prefix_fill ("fill") -- partition S1 flat; then treat
+    g1 = [m1, buf_end) as a supply of all->= SWAP SLOTS and run the
+    prefix_fill idea ACROSS the wrap: scan S2 from its RIGHT end in branchless
+    offset-fill blocks (unconditional byte write + setcc add, 8x unrolled,
+    same as pdqsort), and rotate each found below directly into the next slot
+    (fill_slots cyclic rotation: 2 moves per element, one temp per block).
+    When slots or suffix run low: phase 2 = flat sized_partition of the
+    remaining (left) part of S2 + the SAME two-arm bridge, now bounded by the
+    block size remainder logic.  This is exactly the header's prefix_fill with
+    the slot region and the scan region living in two different contiguous
+    arrays -- prefix_fill never requires them contiguous with each other:
+    * phase-1 pairing uses two independent pointers anyway;
+    * the phase-2 bridge arms are swap_ranges between two contiguous regions.
+    + Each below of S2 is moved ONCE (2 moves), never re-swapped: beats C1's
+      double-handling when both c2 and g1 are large (mid wrap, p ~ 0.5),
+      especially for 16-byte pairs where moves dominate.
+    + The phase-1 scan can use the AVX2 vfill_right for eligible int types
+      (the LUT fill already exists) -- idea F3 below.
+    - Scattered rotation writes don't vectorize; for ints the pure-SIMD C1
+      pipeline may still win.  MEASURE.
+    Note fill direction: scan S2 from the right so consumed right blocks
+    become all->= and are settled (mirror of the flat prefix_fill insight:
+    the prefix/slots are swap TARGETS, not scan input).
+
+C3. gap_cyclic -- SMALL-n tier.  The branchless Lomuto gap method run over the
+    LOGICAL range with chunked wrap handling:
+    * j (the gap cursor) is chunked: j in [0, len1-1) flat over S1; ONE
+      explicit iteration for j = len1-1 (reads v[j+1] = S2[0] across the
+      wrap); j in [len1, n-1) flat over S2.  Zero per-iteration wrap cost.
+    * i (the boundary cursor) advances 0/1 per iteration, data-dependently ->
+      cannot be chunked; instead keep a physical pointer pi and do
+      `pi += below; pi = (pi == buf_end) ? buf_begin : pi;` -- one cmp+cmov
+      per iteration, no branch.  i <= j so pi wraps at most once.
+    * Generalizes to a start offset exactly like gap_off (open the gap at
+      logical `offset`): tmp = v[offset], j from offset -- ONE kernel serves
+      both cyclic_partition (offset=0) small tier and cyclic_offset_partition
+      small tier.
+    Cost: n compares + 2n moves + ~1 cycle/elem cmov tax; no setup, no bridge.
+    Expected winner for small n (vs C1 = two lomutos' setup + bridge).
+    MEASURE the crossover.
+
+C4. fully wrap-aware block/compress partition (single pass, no bridge):
+    all four cursors (two read, two write / two offset-buffer bases) wrap
+    independently; reads chunked to full vectors within a segment; stores
+    straddling the boundary need split/masked stores; offset-buffer bases must
+    be reset at segment crossings (offsets are uchar relative to a base -- not
+    linear across the wrap).  Doable but a LOT of code; the win over C1/C2 is
+    bounded by the bridge cost (<= min(c2,g1) vectorized swaps).  DECISION:
+    implement only if benchmarks show C1/C2 leave >10-15% on the table at
+    realistic wrap positions.  (Expectation: they won't at near-end wraps,
+    might at exactly-mid wraps for L2-resident ints.)
+
+C5. rotate-first (make the range contiguous, then flat-partition): REJECTED --
+    rotating within the ring would have to move elements OUTSIDE the logical
+    range (the free gap), which violates the don't-touch contract, and costs
+    O(n) extra moves anyway.
+
+C6. count-first (vectorized count of belows to learn c, then place directly):
+    REJECTED -- knowing c in advance does not reduce the required data
+    movement; every two-cursor scheme already places elements on their final
+    side in one pass.  Adds a full extra read pass.
+
+C7. small-n copy-out: memcpy the wrapped range into a stack buffer, flat
+    partition, memcpy back.  2n extra moves but perfectly branchless and the
+    flat kernel is optimal.  Only conceivably wins for tiny n where gap_cyclic
+    cmov tax ~ copy cost; unlikely to beat C3 (which has NO extra moves).
+    Keep as an idea; implement only if C3 disappoints.  [Rejected by C3 bench.]
+
+--------------------------------------------------------------------------------
+5. CYCLIC OFFSET PARTITION -- CASE ANALYSIS
+--------------------------------------------------------------------------------
+The logical prefix [0, offset) (all >= key, never compared) interacts with the
+wrap point.  Let off = offset.
+
+Case F (flat, first <= last): delegate to detail::offset::sized_off unchanged.
+    One predictable dispatch branch, zero other overhead.
+
+Case W1 (wrapped, off <= len1): the prefix lies inside S1.
+    Plan A (seg):   c1 = sized_off(S1, off) - first  (flat offset partition of
+                    S1: its own prefix logic, optimal);
+                    m2 = sized_partition(S2); bridge(min(c2, len1-c1)).
+    Plan B (fused): c1 = sized_off(S1, off); then cross-fill S2 into slots
+                    [first+c1, buf_end) (C2 kernel with run2 empty).
+    Note: after sized_off(S1), [first+c1, buf_end) is all >= key: it contains
+    the old prefix leftovers AND the >=-side of S1's own suffix -- both >=.
+
+Case W2 (wrapped, off > len1): S1 is ENTIRELY prefix (pure swap targets, never
+    compared); S2 = [prefix' of off2 = off - len1][ suffix ].
+    Plan A (seg):   c = flat sized_off(S2, off2)  (belows land at S2 front);
+                    bridge with S1: if c <= len1 swap_ranges(buf_begin,
+                    buf_begin+c, first) else swap_ranges(first, buf_end,
+                    buf_begin + c - len1).  (Same two-arm proof as section 3
+                    with roles: "g1" := S1 (all >=), "b2" := below-run at S2
+                    front.)  Downside: min(c, len1) belows moved twice.
+    Plan B (fused): slot supply = TWO contiguous runs, logically ordered:
+                    run1 = S1 (whole), run2 = [buf_begin, buf_begin+off2).
+                    Scan suffix [buf_begin+off2, last) from the right;
+                    fill_slots consumes runs in logical order, splitting a
+                    block's belows across the run boundary by TWO fill_slots
+                    calls (LEGAL: fill_slots(lo, rbase, offs, num) is
+                    semantically a pairwise exchange slot[i] <-> src[i]
+                    implemented as one rotation cycle to save moves; splitting
+                    the offset list into two calls = two independent cycles =
+                    same exchange, one extra temp store per split).
+                    Phase 2: flat-partition the remaining suffix; bridge into
+                    the <= 2 remaining slot runs (up to 2 swap_ranges per arm,
+                    same disjointness argument).
+    GENERALIZATION: ONE kernel cross_fill2(run1, run2, suffix, key) with run2
+    possibly empty covers: plain cyclic C2 (run1=g1), W1 fused (run1=g1 after
+    sized_off), W2 fused (run1=S1, run2=S2-prefix).  Implement cross_fill2
+    once, dispatch three ways.
+
+Case degeneracies to keep free: off == 0 -> plain cyclic partition (must hold
+by construction, not special-cased); off == n -> return 0 immediately (empty
+suffix; gap_off's `offset >= n` early-out generalizes); len2 == 0 (last ==
+buf_begin: wrapped flag but S2 empty) -> flat path on S1.
+
+Small tier: gap_cyclic(offset) (C3) for small SUFFIX length (the compared
+length is n - off, mirroring flat sized_off's `suffix <= lomuto_cutoff` rule).
+NOTE gap_cyclic's cost is over j in [off, n): flat 2-move stream regardless of
+p -- same p-flat property as flat gap_off.
+
+Narrow-type big-prefix rule from the flat dispatcher (offset >= suffix ->
+gap_off for <=8-byte T): re-verify for the cyclic case; the wrapped gap walk
+has the cmov tax, so the crossover may differ.  MEASURE.
+
+--------------------------------------------------------------------------------
+6. DISPATCH PLAN (initial; final numbers come from the benchmarks)
+--------------------------------------------------------------------------------
+cyclic_partition:
+    flat (first <= last)          -> sized_partition           [zero new cost]
+    wrapped, len2 == 0            -> sized_partition on S1
+    wrapped, n <= SMALL_CUTOFF    -> gap_cyclic                [C3]
+    wrapped, simd int fast path   -> seg_bridge (C1) vs fused (C2): MEASURE,
+                                     expect C1 (compress per segment + SIMD
+                                     bridge)
+    wrapped, everything else      -> fused (C2) vs seg_bridge: MEASURE,
+                                     expect C2 for 16-byte pairs (move-bound)
+    SMALL_CUTOFF initial guess: lomuto_cutoff<T> (512 narrow / 24 wide) --
+    but gap_cyclic pays cmov tax while seg_bridge pays 2x setup + bridge;
+    crossover must be measured per element width.
+
+cyclic_offset_partition:
+    flat                          -> sized_off
+    off >= n                      -> return 0
+    wrapped, len2 == 0            -> sized_off on S1
+    wrapped, suffix small         -> gap_cyclic(offset)
+    W1                            -> sized_off(S1) + {bridge | cross_fill2}
+    W2                            -> {sized_off(S2) + S1-bridge | cross_fill2
+                                     with 2 slot runs}
+    per-type winner: MEASURE.
+
+--------------------------------------------------------------------------------
+7. MICRO-ARCH / CODEGEN CONCERNS (the asm checklist)
+--------------------------------------------------------------------------------
+A1. gap_cyclic inner loops: the below() predicate must lower to cmp+setcc (or
+    cmp+cmov chain for the conditional pointer add); NO conditional jump on
+    the predicate.  The pi wrap must be cmp+cmov (cmove/cmovae), NOT a branch.
+    Verify: gcc -O3 -march=native -S, grep the loop for jcc between the loads.
+A2. cross_fill2 phase-1 fill: identical codegen to the flat prefix_fill loop
+    (unconditional byte store + setcc + add, 8x unrolled, no branch).  The
+    slot-run split must live OUTSIDE the 8x block loop.
+A3. The bridge swap_ranges: must vectorize (vmovdqu x2 load + x2 store per
+    32B).  If GCC fails on pair types via iter_swap, hand-roll a
+    trivially-copyable byte-swap loop.  Check both i64 and pair64.
+A4. No reloads of key/buf_end/buf_begin inside hot loops (they are loop
+    invariants held in registers; passing key by value already guarantees the
+    key part).
+A5. The compare for pair-lex is branchy by nature when routed through
+    operator< against a fixed key inside below() -- SAME behavior as the flat
+    kernels (fair comparisons).  IDEA (logged, not required for this task):
+    a make_below() adapter that detects pair_like + std::less and computes
+    (f < kf) | ((f == kf) & (s < ks)) branchlessly, benefiting flat AND
+    cyclic paths alike.  Deferred: changes flat-kernel behavior/scope.
+A6. Register pressure: cross_fill2 keeps {lo, run1_end, run2_lo, run2_end,
+    last, sfirst, key, offsets ptr, num_r} live -- 9-ish values; x86-64 has
+    15 GPRs + key possibly in xmm for pairs.  Fine, but keep the phase-1
+    block body free of rematerializable spills: check asm for stack traffic
+    in the 8x loop.
+A7. Alignment: offset buffer stays cacheline-aligned (reuse align_cacheline +
+    alignas storage).  Bridge swap_ranges is unaligned-tolerant (vmovdqu).
+A8. Meteor Lake P-core L2 is 2 MiB (vs Zen 3's 512 KiB default in
+    PARTITIONS_L2_BYTES) -> the compress/block_simd crossover on THIS machine
+    sits at larger n; leave the default for the shipped header (portable), but
+    note it when reading large-n bench results (or re-run with
+    -DPARTITIONS_L2_BYTES=2097152 as a sensitivity check).
+
+--------------------------------------------------------------------------------
+8. CORRECTNESS TEST PLAN (standalone test_cyclic_partitions.cpp, root)
+--------------------------------------------------------------------------------
+T1. Oracle: copy logical range out to a flat vector, count belows c_ref;
+    after the call verify (a) return value/count == c_ref, (b) logical [0,c)
+    all below, [c,n) all >=, (c) multiset of the logical range preserved,
+    (d) canary elements outside [first,last) logical range untouched (fill the
+    free gap with sentinel values), (e) boundary normalization convention.
+T2. Exhaustive small: n in [0, 12], ALL 2^n 0/1 patterns, ALL wrap splits
+    (len1 in [0? no: 1..n] -- plus the flat placement), key in {0,1,2} =>
+    covers c==0, c==n, all-equal, empty S2.  For offset: all offsets 0..n with
+    the prefix forced >= key.
+T3. Randomized large: n in {13..~50k log-spaced}, random wrap split, types
+    {i32, i64, pair32, pair64} x comps {lex less, first-only}, keys at random
+    percentiles incl. duplicates-heavy distributions; every kernel variant
+    (wrap_hoare, gap_cyclic, seg_bridge, fused, dispatcher) against the oracle.
+T4. Kernel-forcing: test each internal kernel directly, not just the
+    dispatcher, so tier changes can't hide a broken kernel.
+T5. Edge inventory: n=0; n=1 (both segments); len1=1; len2=1; wrap with
+    last==buf_begin (len2=0); flat with last==buf_end; off=0; off=n; off=len1
+    exactly (W1/W2 boundary); off=len1+-1; c crossing len1 exactly (bridge arm
+    boundary); all-below; all-above.
+
+--------------------------------------------------------------------------------
+9. BENCHMARK PLAN (standalone bench_cyclic_partitions.cpp, CSV to stdout)
+--------------------------------------------------------------------------------
+Methodology (per repo memory): raw min ns/elem over >=25 reps (min filters
+scheduler noise), batched independent blocks for n <= 4096 (defeat branch
+predictor memorization across reps and amortize timer), single block above;
+data regenerated per measurement from a fixed-seed xorshift; taskset -c 0
+(P-core); report raw numbers, keep negative results in this file.
+
+Axes:
+  types:  i64, i32, pair<i32,i32>, pair<i64,i64>
+  comps:  lex (std::less<>), first-only (proj = &pair::first)  [pairs only]
+  n:      2^4 .. 2^22 (log steps; dense 16..1024 for the small crossover)
+  wrap:   len2/n in {0 (flat ref), 1/64, 1/8, 1/2, 7/8, 63/64}
+  p:      below fraction {0.05, 0.5, 0.95} (key at that percentile)
+  offset: off/n in {0, 1/8, 1/2, 7/8} crossed with wrap (selected slices:
+          off<len1 vs off>len1 regimes must both be covered)
+Contenders per cell: gap_cyclic, seg_bridge, fused, dispatcher, flat
+sized_partition on same n (the "wrap tax" reference), wrap_hoare (one slice
+only, as the naive-cost exhibit).
+Deliverables: winner table per (type, n-band, wrap-band) -> final dispatch
+constants; wrap-tax table (dispatcher vs flat) -- goal: ~0 tax for near-end
+wraps, small single-digit % for mid wraps at large n.
+
+--------------------------------------------------------------------------------
+10. RISKS / OPEN QUESTIONS (resolve during implementation+bench)
+--------------------------------------------------------------------------------
+R1. gap_cyclic's `pi == buf_end` cmov sits on the pointer dep chain; if it
+    measurably drags, alternative: run the j-chunk loops with i as an INDEX
+    plus a branchless `pi = base1 + i - (i >= len1 ? len1 - (buf_begin-... )`
+    -- messy; or split the i-domain: while i < len1 use S1 pointer, once i
+    crosses (checked in the CHUNK header, since crossing is monotone) switch
+    loops.  i-crossing is data-dependent but happens ONCE: a two-version loop
+    with a mid-loop switch [goto from inside the chunk] keeps both inner
+    loops wrap-free.  Try only if asm/bench flags it.
+R2. seg_bridge for ints beyond L2: two compress/block_simd passes touch S1
+    and S2 in sequence -- same total bytes as flat, plus bridge traffic;
+    should track flat closely.  If the bridge's extra pass over up-to-n/4
+    elements shows up at DRAM sizes, consider C4 (wrap-aware block partition)
+    for the huge-n int tier only.
+R3. The `at` (position-pivot) form: skipped for cyclic -- a position pivot
+    would need wrap-aware sentinel logic for marginal gain (the flat `at`
+    only elides one bound check in the left scan); the cyclic API takes keys.
+    Logged as future work.
+R4. first==last ambiguity (empty vs full) is resolved as EMPTY by fiat (D1);
+    callers with a full buffer pass the flat [buf_begin, buf_end).
+R5. Unsigned keys: simd_eligible requires SIGNED ints (vpcmpgt semantics);
+    unsigned falls to scalar tiers exactly like the flat entry points.  Not a
+    regression; noted.
+R6. Benchmarking on a laptop (Meteor Lake): thermal drift + E-cores. Mitigate:
+    taskset to P-core 0, min-of-reps, interleave contenders (round-robin over
+    variants inside each rep so drift hits all equally), fixed seeds.
+
+--------------------------------------------------------------------------------
+11. IMPLEMENTATION ORDER
+--------------------------------------------------------------------------------
+ 1. detail::cyclic namespace in refactored_partitions.hpp:
+    wrap_hoare (ref), gap_cyclic (C3, with offset param), seg_bridge (C1),
+    cross_fill2 (C2 kernel, 2 slot runs), offset seg variants (W1/W2 plan A),
+    dispatchers; public cyclic_partition / cyclic_partition_count /
+    cyclic_offset_partition.
+ 2. test_cyclic_partitions.cpp (section 8); run under -O1 and -O3, plus
+    -fsanitize=address,undefined run.
+ 3. asm inspection pass (section 7 checklist); fix codegen regressions.
+ 4. bench_cyclic_partitions.cpp (section 9); run pinned; collect CSV.
+ 5. Set dispatch constants from measurements; re-run tests; record final
+    numbers + winner tables + negative results BELOW in this file.
+
+================================================================================
+RESULTS LOG (2026-07-11, Meteor Lake Core Ultra 7 165H P-core, taskset -c 0,
+GCC 15.2, -O3 -march=native; min ns/elem; method of section 9)
+================================================================================
+
+WHAT SHIPPED (refactored_partitions.hpp)
+  partitions::cyclic_partition / cyclic_partition_count / cyclic_offset_partition
+  detail::cyclic::{wrap_hoare, gap_cyclic, bridge, seg_bridge, cross_fill2,
+                   seg_fill, off_w1_fill, off_w1_seg, off_w2_fill, off_w2_seg}
+  tuning::{cyclic_gap_max_lex=24, cyclic_gap_max_simd=512, cyclic_gap_max=1024,
+           cyclic_off_gap_max_lex=24, cyclic_off_gap_max_simd=256,
+           cyclic_off_gap_max=1024}
+  Correctness: test_cyclic_partitions.cpp -- 10,342,154 checks (exhaustive
+  n<=10 0/1 x all wraps x all offsets x 3 keys; randomized to n=50k; every
+  kernel forced directly), green at -O1, -O3, and ASan+UBSan.
+  C4 (fully wrap-aware single-pass block kernel) and C7 (copy-out) were NOT
+  implemented -- see negative results.
+
+ASSEMBLY VERIFICATION (checklist section 7; gcc -O3 -march=native -S)
+  A1 gap_cyclic i64: chunk A body = 10 instr, predicate lowered to
+     setg+movzx+lea (conditional pointer advance), NO data branch, NO wrap
+     check; one cmov total in the function (the one-time boundary-step
+     normalization).  Chunk B: see R1 RESOLUTION below.
+  A2 cross_fill2: scalar fill loop = unconditional byte store + setcc + add,
+     8x unrolled, branch-free; on the AVX2 int path the fill is
+     vpcmpgtq/vpcmpgtd + movmsk + LUT (vfill_right reused as planned, F3).
+  A3 bridge/swap_ranges: vectorised for BOTH i64 and pair<i64,i64> (ymm
+     load-pair/store-pair, 1 load + 1 store per element per side).
+  A5 pair-lex below(): short-circuit branches, exactly as in the flat
+     kernels (fair; the branchless-lex adapter idea stays logged, deferred).
+  first-only pair projection: pure setl+add, fully branchless.
+
+R1 RESOLUTION -- the chunk-B wrap check (measured, the key micro-arch find)
+  v1 used `pi = (pi==buf_end) ? buf_begin : pi` (cmp+cmov) per iteration.
+  The cmov SERIALISES the pi dependency chain: ~1.6 cycles/elem extra, and
+  the cost scales with the wrapped fraction (chunk B length).
+  v2 splits chunk B: while pi is in S1 the test is a predicted-not-taken
+  BRANCH (off the dep chain, taken exactly once at the crossing), then a
+  test-free flat loop.  i64 gap_cyclic, p=0.5 (ns/elem, v1 -> v2):
+      wrap w=1/64   1/8    1/2    7/8    63/64
+      n=256  0.52->0.47  0.54->0.47  0.68->0.49  0.71->0.50  0.72->0.48
+      n=65536 0.63->0.49 0.59->0.49  0.65->0.49  0.70->0.49  0.72->0.49
+  gap_cyclic is now FLAT in the wrap fraction at ~0.48 ns/elem (i64), i.e.
+  the wrapped gap walk costs the same as its unwrapped equivalent.  This
+  moved every gap-tier cutoff up (256->512/1024) and re-ran the whole tier
+  optimisation.
+
+FINAL DISPATCH (regret = mean over all measured (n<=4096|suffix, wrap) cells
+vs the per-cell best kernel, p=0.5)
+  plain:
+    pair-lex (lex_pair_like + default less): n<=24 gap, else seg_bridge
+        cutoff sweep 16/24/32/48/64: 1.4/1.2/1.5/2.2/3.2 %  -> 24
+    AVX2 ints: n<=512 gap, else seg_fill
+        sweep 256/384/512/768/1024/4096: 2.9/1.7/0.7/0.6/1.1/3.4 % -> 512
+    other (first-proj pairs etc.): n<=1024 gap, else seg_fill
+        sweep 128/256/512/768/1024/2048: 8.2/4.6/1.9/0.8/0.05/0.05 % -> 1024
+  offset (gate on SUFFIX = n - offset):
+    pair-lex: suffix<=24 gap; offset<=len1 -> off_w1_seg, else off_w2_fill
+        (W1 seg / W2 fill mixed rule: 0.5% mean; fill-only 9.1%, seg-only
+        worse at W2 -- the split is real)
+    AVX2 ints: suffix<=256 gap, else w1/w2_fill  (sweep 64/128/256/512:
+        3.3/3.4/0.8/1.9 % on i64 L2=0)
+    other: suffix<=1024 gap, else w1/w2_fill (sweep 256/512/1024: 2.8/3.1/2.0)
+  Dispatcher-vs-best-kernel validation (mean regret, all cells incl. p sweep):
+    plain:  i64 2.3% / i32 2.7% (L2=0), p32-lex 2.1%, p64-lex 1.2%,
+            p32-first 3.2%, p64-first 3.8%
+    offset: i64 1.5% (L2=0), i32 5.7%, p64-lex 1.2%, p64-first 4.7%
+    Worst single cells are p-extreme (p=0.95) or cutoff-band compromises;
+    p is unknowable at call time (expected-cost choice, as in the flat
+    dispatcher).
+
+HEADLINE NUMBERS (dispatcher, p=0.5, ns/elem)
+  wrap tax = cyclic dispatcher vs flat sized_partition on the same n
+  (n >= 4096 mean; ints under -DPARTITIONS_L2_BYTES=0, see negative results):
+      plain             w=1/64   1/8     1/2     7/8    63/64
+      i64               +0.4%   +3.5%   +8.6%   +3.8%  -0.1%
+      i32               +2.8%   +6.2%  +17.8%   +4.9%  +5.1%
+      p32-lex           +0.2%   +2.5%   +3.9%   +2.2%  +0.2%
+      p64-lex           -0.9%   +4.5%   +7.1%   +1.0%  -0.6%
+      p32-first         +0.3%   +2.4%   +8.7%   +1.9%  -2.0%
+      p64-first         +1.7%   +0.9%  +10.0%  +10.5%  -0.5%
+  The mid-wrap (w=1/2) tax is the bridge/fill cross-traffic bound of section
+  3; near-end wraps are effectively FREE.  Naive per-access wrap checking
+  (wrap_hoare) costs 3.6-3.9 ns/elem on i64 = 7-8x the dispatcher.
+  OFFSET partition: the cyclic dispatcher BEATS the flat offset_partition
+  reference on most of the matrix (n >= 4096 mean vs flat, p=0.5):
+      i64: -2..-12%   i32: -7..-19%   p64-lex: -1..-9%   p64-first: -1..+13%
+  Cause: cross_fill2 scans with the AVX2 vfill_right while the flat
+  prefix_fill fills scalar -- the cyclic path is the faster offset partition
+  on eligible integer types (e.g. i64 n=65536 off=n/2: 0.19 vs 0.25 flat).
+
+NEGATIVE RESULTS (kept per methodology)
+  N1. The flat dispatcher's "narrow T && offset >= suffix -> gap" rule is
+      WRONG for the cyclic case and was dropped: w_fill beats gap_cyclic
+      2-3x in exactly that regime (i64 n=65536 off=7n/8: fill 0.046,
+      gap 0.107; the vectorised scan + once-moved rotation dominates the
+      p-flat 2-move gap stream once vfill_right is in play).
+  N2. seg_fill (fused, no bridge) LOSES to seg_bridge + vectorised bridge for
+      pair-lex at every measured mid wrap (p64-lex n=65536 w=1/2: 2.48 vs
+      1.95): fill_slots' scattered rotation writes cost more than the bridge
+      it saves when the compare is branchy.  Fused wins only for
+      cheap-compare classes -> the two-class dispatch.
+  N3. cmov beats branch is FALSE on a loop-carried pointer chain: the
+      chunk-B cmov cost ~1.6 cycles/elem vs a predicted-not-taken one-shot
+      branch (see R1 RESOLUTION).  cmov only wins when the alternative
+      branch is data-dependent and UNpredictable.
+  N4. MACHINE NOTE: the AVX2 compress tier (block_compress) never wins on
+      Meteor Lake -- flat i64 n=4096..65536 runs 0.85 ns/elem under the
+      default PARTITIONS_L2_BYTES=512KiB vs 0.35-0.38 with the tier disabled
+      (-DPARTITIONS_L2_BYTES=0); the Zen 3 crossover does not transfer.  On
+      this machine build with -DPARTITIONS_L2_BYTES=0 (flat AND cyclic both
+      gain; all int tier decisions above were made under that setting; the
+      shipped defaults stay Zen 3 per the header's provenance).
+  N5. C4 (fully wrap-aware single-pass block/compress kernel, no bridge) was
+      not implemented: its ceiling is the mid-wrap tax, measured <= ~9-18%
+      in the worst (w=1/2) column and ~0 elsewhere, against a large
+      complexity bill (four wrapping cursors, split/masked stores, offset
+      bases reset at crossings).  Revisit only if exactly-mid wraps dominate
+      a real workload.  C7 (small-n copy-out) was obsoleted by gap_cyclic
+      (no extra moves, and now wrap-flat).
+  N6. At p=0.95 (below-heavy) offset cells, gap/w_seg can beat w_fill by up
+      to ~2x on some types (i32 n=1024 off=n/2 p=0.95: seg 0.148 vs fill
+      0.30); p is unknowable at call time and the expected-cost choice over
+      the p sweep favours fill -- same trade the flat dispatcher makes.
+
+REPRO
+  g++ -std=c++23 -O3 -march=native test_cyclic_partitions.cpp -o t && ./t
+  g++ -std=c++23 -O3 -march=native bench_cyclic_partitions.cpp -o b
+  taskset -c 0 ./b plain [type]   # type in {i64,i32,p32,p64,p32f,p64f}
+  taskset -c 0 ./b offset [type]  # type in {i64,i32,p64,p64f}
+  (add -DPARTITIONS_L2_BYTES=0 on Meteor Lake, see N4)
+================================================================================
+
+================================================================================
+ROUND 2 -- PAIR EFFICIENCY (int/long/float/double pairs), PORTABILITY
+================================================================================
+Task: (a) make the cyclic implementations genuinely fast for pair<int,int> and
+pair<long,long>; (b) benchmark pair<float,int> and pair<double,long> under lex
+and first-only orders; (c) inspect the assembler; (d) make the code fast on
+other CPUs (modern Xeon, AMD).  Ideas logged BEFORE implementation, as before.
+
+--------------------------------------------------------------------------------
+2.1 THE BRANCHLESS LEX COMPARATOR (idea A5, now in scope)
+--------------------------------------------------------------------------------
+Round-1 asm finding: for pair-like T under the default `<`, below(x) is
+std::pair's short-circuit lexicographic compare -- a data-dependent BRANCH per
+element in every scan loop, mispredicting ~50% on random data.  That is why
+pair-lex runs ~1.9-3.4 ns/elem while first-only pairs run ~0.5.  The partition
+kernels only ever use comp as `x < KEY` (unary, fixed key), and even
+element-element uses (halvers) accept any strict weak order, so a semantically
+identical branchless comparator can be substituted:
+
+    lex_less(a, b) = (a.f < b.f) | ((a.f == b.f) & (a.s < b.s))
+
+computed with setcc/and/or -- no jcc.  PRECEDENT: detail::net::cswap already
+uses this exact formulation for its pair-lex fast path (same eq-vs-
+incomparability caveat).  Semantics: identical to pair::operator< for totally
+ordered members; for float/double members it matches whenever no NaN is
+present (with a NaN, `==` is false where operator<'s !(b<a)&&!(a<b) is true;
+NaN breaks the required strict weak ordering anyway, so this is inside the
+existing comparator contract).  +/-0.0 agrees: == is true, both compare
+seconds.
+
+WHERE: substituted at the CYCLIC public entry points (cyclic_partition{_count},
+cyclic_offset_partition) when Comp = std::less<> / less<T>, Proj = identity,
+and K == iter_value_t is lex_pair_like.  It then flows into every internal
+kernel (gap_cyclic, fill loops, and the flat kernels seg_bridge/seg_fill call),
+so the whole cyclic path becomes branch-free for these types.  The flat public
+entry points are left untouched (their provenance is the source repo's
+measured behavior); porting the same substitution there is logged as a
+follow-up, with a measured estimate below.
+
+CONSEQUENCE FOR DISPATCH: the entire "class B / lexish" split existed only
+because the pair-lex compare was branchy.  With the substitution the pair-lex
+types should behave like the cheap-compare class (first-proj pairs) -->
+re-measure p32/p64-lex plus the two new float types across the matrix, re-run
+the regret optimisation, and either retire class B or re-gate it.
+
+RISKS: (r1) GCC might lower `(f<kf)|((f==kf)&(s<ks))` for FLOAT members
+through branches (comiss + setcc is expected; verify asm).  (r2) The two
+loads + 3 setcc lengthen the below() dependency for gap_cyclic's conditional
+pointer advance -- measure, don't assume.  (r3) K passed by value must stay
+in registers (16-byte pair key = 2 GPRs / 1 xmm; check no stack reload in the
+fill loop).
+
+--------------------------------------------------------------------------------
+2.2 NEW BENCH/TEST TYPES
+--------------------------------------------------------------------------------
+pf32 = pair<float,int> (8B, lex + first), pd64 = pair<double,long> (16B, lex +
+first).  Values drawn from small integer domains cast to float/double (exact,
+generates real first-coordinate ties so the second-compare path is exercised);
+NaN-free by construction (SWO contract).  Both satisfy lex_pair_like (members
+trivially copyable, <=8B, no padding).  Neither is simd_eligible (not
+integral) -> scalar tiers; first-only float compare should lower to
+comiss+seta (branchless, verify).  Add both to the correctness suite
+(exhaustive small + randomized, lex and first configs) -- the oracle uses
+std::pair::operator<, so it doubles as a semantic check of 2.1.
+
+--------------------------------------------------------------------------------
+2.3 PORTABILITY / GENERICITY IDEAS (Xeon, AMD, beyond)
+--------------------------------------------------------------------------------
+P1. Tuning knobs as macros: the cyclic gap gates are measured numbers of ONE
+    microarchitecture, exactly like the two existing macro knobs.  Make them
+    macro-overridable (PARTITIONS_CYCLIC_GAP_MAX{,_SIMD}, ..._OFF_GAP_MAX
+    {,_SIMD}) with the Meteor Lake-measured defaults; retuning for a Xeon/EPYC
+    is then a compile line, not a code edit.  The gates are SOUND at any
+    value (every kernel is correct at every size), only optimality is
+    arch-dependent -- same portability contract as the existing knobs.
+P2. The one-shot-branch wrap (R1) is the right choice on every modern
+    predictor (Golden Cove, Zen 3/4/5, Neoverse): a branch taken once per
+    call is effectively free after the first misprediction, while a cmov taxes
+    the dependency chain everywhere.  No arch-specific code needed.
+P3. The compress/simd L2 crossover does NOT transfer between vendors (N4:
+    Zen 3 yes, Meteor Lake never).  Fast-on-arrival recipe per target:
+    Zen 3/4 keep the default; Meteor/Arrow Lake use
+    -DPARTITIONS_L2_BYTES=0; for an unknown Xeon, run bench_cyc plain i64 and
+    read the flat column at n=4k..256k -- if the <=65536 band is SLOWER than
+    the >=262144 band, set 0.  This stays a macro because a header-only
+    library cannot cheaply do runtime cache detection (and a runtime branch
+    per call would poison the small-n tiers).
+P4. AVX-512 (Icelake+ Xeon, Zen 4/5): vpcompressd/q + masked stores implement
+    the compaction partition natively -- no LUT, no double-store trick needed:
+    compress-store left lanes forward, right lanes backward; measured
+    elsewhere at ~2x AVX2 compress.  Also 64-byte fills for the offset
+    buffers.  This slots cleanly behind the existing structure as a
+    detail::avx512 sibling with the same three entry shapes (fill_left/
+    fill_right/compress); the cyclic layer inherits it FOR FREE through
+    sized_partition + vfill hooks.  Logged as the highest-value future kernel
+    work; not implemented in this round (no AVX-512 hardware here to measure,
+    and unmeasured SIMD kernels are against the house methodology).
+P5. Unsigned integer keys could join the SIMD fast path via the sign-bias
+    trick (x ^ 0x80..0 monotonically maps unsigned to signed order) applied
+    inside vfill/compress; scalar tiers already handle unsigned.  Logged.
+P6. Non-x86 (Neoverse/Apple): all scalar tiers use bool+ternary / setcc-add
+    idioms which lower to csel/cset/cinc on AArch64; the XOR-mask swaps are
+    ISA-neutral; only the avx2 namespace is guarded.  cacheline_bytes=64
+    holds for Neoverse; Apple M* prefers 128 -- already a named constant.
+P7. Also verify pair<float,int>/pair<double,long> hit the intended cswap paths
+    if median_partition is ever used on them (they are pair_like_swappable, so
+    yes by construction).
+
+Implementation order: 2.1 comparator + substitution -> tests (incl. new
+types) -> asm -> bench matrix for all six pair configs -> regret/retune ->
+P1 macros -> results log.
+
+--------------------------------------------------------------------------------
+2.4 ROUND-2 RESULTS -- ASSEMBLY (verified before benching)
+--------------------------------------------------------------------------------
+Probes: gap_cyclic and cross_fill2 instantiated with lex_less_branchless for
+p64=pair<i64,i64>, pf32=pair<float,i32>, pd64=pair<double,i64>, plus the
+first-only float projection.  gcc 15.2 -O3 -march=native.
+
+  * p64 lex gap loop: 16-byte element moved as one xmm (vmovdqu), halves
+    read via vmovq/vpextrq; compare = cmp/sete + cmp/setg + and + cmp/setg +
+    or; advance = movzx/sal/add (conditional pointer bump by 0/16).  ZERO
+    data-dependent jumps; key .first/.second pinned in r8/r9 (risk r3: no
+    stack reloads).
+  * pf32 / pd64 lex (float first member -- risk r1): == lowered NaN-correctly
+    as vucomiss/vucomisd + setnp + cmovne, < as vcomiss/vcomisd + seta,
+    second member integer cmp/setl, combined with and/or.  Fully branchless;
+    key in xmm0 + GPR.
+  * The pdqsort block fill (branchless_partition under lex_less_branchless,
+    i.e. what seg_bridge/seg_fill run): per element setg/sete/and + setl/or
+    then `cmp r11b,1; adc rax,0` counter advance + unconditional byte store,
+    8x unrolled -- the mispredicting jcc per element that pair-lex had in
+    round 1 is GONE end to end.  The pre-loop guarded scans keep their
+    branches (O(1) amortised, same as reference pdqsort).
+  * Correctness: suite extended with pf32/pd64 (lex + first) -> 15,532,947
+    checks green at -O3 and under ASan+UBSan; the oracle compares with
+    std::pair::operator<, so the substitution's ordering equivalence is
+    machine-checked on integer-and-float pairs (ties on .first included).
+
+Minor codegen note (accepted): GCC re-issues `cmp` for the sete/setg pair on
+the same operands instead of reusing flags -- one extra uop per compare, not
+worth contorting the source.
+
+--------------------------------------------------------------------------------
+2.5 THE REGISTER-ALLOCATION LOTTERY (forensics) + THE PACKED-u64 COMPARATOR
+--------------------------------------------------------------------------------
+SYMPTOM: the same gap_cyclic<pair,lex_less_branchless> instantiation runs
+~1.0 ns/elem in some TU contexts and ~2.65 in others (p-independent, no
+branches, identical loop STRUCTURE in both).  Affected: the public
+dispatcher's gap tier for p32/pf32/pd64 (and p32's bridge tier), standalone
+instantiations; unaffected: the bench's direct-call context, the offset
+dispatcher (won its lottery), all single-compare classes.
+
+ROOT CAUSE (from objdump diff of fast vs slow copies): the loop reloads *pi
+at the bottom (the held element for the next gap move).  In slow copies GCC
+allocates a setcc DESTINATION onto the register holding that reload
+(`setnp al` where eax = just-loaded [rcx+4]); an 8-bit setcc write MERGES
+with the register's upper bytes, so the predicate chain acquires a
+dependency on a store-to-load-forwarded reload -> the loop-carried chain
+grows from ~4 to ~12 cycles.  In fast copies the setcc scratch lands on a
+lea-derived register (integer-only chain).  Which happens is decided by
+register allocation per inlining context -- a lottery.
+
+FAILED FIXES (measured, kept as negative results):
+  * source reshaping (load into a named local, compare the value before the
+    store): GCC canonicalises to IDENTICAL gimple/asm -- no effect.
+  * carrying the held element in a register with a branchless XOR/cmov
+    select (load new *pi only on advance): 4.98 ns/elem -- the select's
+    unconditional load store-forwards EVERY iteration and the cmov waits for
+    it; strictly worse.
+ENGINEERING FIX (tuning::*_mlex): the multi-setcc comparator gets its own
+gates keyed on Comp == lex_less_branchless, tuned to DISPATCHER-context
+codegen: plain n<=24 gap, <=1024 seg_bridge, above seg_fill; offset
+suffix<=256 gap, above fill.  User-path improvements (dispatch, w=0.5,
+branchy flat as baseline):
+    pd64: n=256 2.64->1.77, n=1024 2.67->1.54, n=65536 1.53->1.24 (flat 3.64)
+    pf32: n=256 2.67->2.07, n=1024 2.71->2.12 (flat 3.61-3.66)
+    p64:  n=1024 1.25->1.00 (flat 1.92); n=64 regressed 1.50->2.11 (accepted:
+          p64's gap tier had WON its lottery; the mlex gate trades it for
+          robustness across the class)
+    p32:  still ~2.6 at 256-1024 -- p32's dispatcher BRIDGE also lost the
+          lottery -> fixed by the packed comparator below.
+
+PACKED-u64 LEX COMPARATOR (8-byte INTEGER pairs; exact semantics, no
+lottery): for pair<int32,int32> (and any 4+4-byte integral pair), lex order
+equals ONE unsigned 64-bit compare after packing:
+    packed(x) = (order_map(x.first) << 32) | order_map(x.second)
+    order_map: signed int -> bits ^ 0x80000000 (order-preserving to unsigned),
+               unsigned  -> identity
+On little-endian the whole pair loads as one u64 (first in the LOW half), so
+packing is rotl(load,32) + one xor-mask fold: ~3 ALU ops + ONE setb -- no
+setcc chain, nothing for the allocator to mis-place, and absolutely faster
+than 3 setccs.  NOT applied to float-first pairs: the standard float->ordered
+-int total order distinguishes -0.0 from +0.0, so packed order would DIVERGE
+from operator< on +/-0 ties (lex_less_branchless matches operator< exactly
+there); float pairs keep the 3-setcc comparator and the mlex gates.
+IMPLEMENTED as detail::cyclic::lex_less_packed, substituted for
+int_pair_packable element types (little-endian gate; big-endian falls back
+to lex_less_branchless).  Verified asm (dispatcher context): the p32 gap
+loop is one u64 move + rorx/xor/cmp/setb/movzx/lea, key packed and hoisted.
+Tests extended with full-width values (negative members) to exercise the
+sign-bias: 15,532,992 checks green (+ ASan/UBSan).
+
+--------------------------------------------------------------------------------
+2.6 ROUND-2 FINAL NUMBERS (user path = cyclic_partition_count with std::less<>,
+    substitution engaged; "flat" = flat sized_partition with the same branchy
+    std::less<> the user would get there; w=0.5 worst wrap, p=0.5)
+--------------------------------------------------------------------------------
+                 n=64        n=256       n=1024      n=65536     n=2^20
+  p32  lex   0.68 (fl 3.30)  0.55/3.25   0.49/1.91   0.53/1.83   0.55/1.87
+  p64  lex   2.11 (fl 2.47)  1.32/2.11   1.00/1.92   0.81/1.85   0.93/1.90
+  pf32 lex   1.97 (fl 3.63)  2.07/3.61   2.12/3.66   1.21/3.60   1.22/3.66
+  pd64 lex   2.41 (fl 4.03)  1.77/3.69   1.54/3.64   1.24/3.64   1.28/3.73
+  pf32 first 0.66 (fl 0.67)  0.66/0.67   0.62/0.67   0.63/0.58   0.64/0.59
+  pd64 first 0.76 (fl 0.86)  0.76/0.86   0.69/0.70   0.64/0.60   0.73/0.65
+  (pair-first columns from the R2 slices -- that path was already branchless
+  and needed no changes.)
+  Net vs the branchy flat baseline at w=0.5: p32-lex 3.4-6.6x, pf32-lex
+  1.8-3.0x, pd64-lex 1.7-2.9x, p64-lex 1.2-2.3x FASTER; the CYCLIC partition
+  of a wrapped range now beats the FLAT partition of the same data for every
+  lex-pair type, because the flat entry points still run std::pair's branchy
+  operator<.  FOLLOW-UP (logged, out of scope): port the same substitution
+  pair (lex_less_packed / lex_less_branchless) to the flat entry points --
+  measured estimate from the bench's flat-with-explicit-comparator column:
+  p64 flat 1.8-2.5 -> 0.74-1.5 ns/elem.
+P8 (logged, future): a vectorized packed compare would put p32-lex on the
+  AVX2 fast path outright (vpshufd half-swap + vpxor bias + vpcmpgtq inside
+  vfill/compress) -- p32-lex would then match i64's SIMD tiers end to end.
+================================================================================
+
+================================================================================
+ROUND 3 -- RECONCILIATION WITH THE REPO'S PRIOR ART, PREVENTION, AND THE
+CORRECTED PORT TO THE FLAT ENTRY POINTS
+================================================================================
+3.1 SAME TRAP OR NEW TRAP?  Verdict: THE SAME, DOCUMENTED trap -- with both
+poles already studied and recorded in this repository:
+
+  * NETWORK pole (element-vs-element compare-exchanges): the fully branchless
+    lex predicate `(b0<a0)|(b0==a0 & b1<a1)` + XOR-mask swap WINS 2.4-4.5x.
+    Documented: refactored_partitions.hpp detail::net comments,
+    docs/small_sort_findings.md ("One generalised branchless lexicographic
+    compare-exchange...").
+  * FIXED-PIVOT pole (partition scans, every element vs ONE key):
+    include/partitions/algorithms.hpp lines ~414-426, a KEPT NEGATIVE RESULT:
+    the same branchless predicate made the block partition ~30-47% SLOWER
+    (pair64 2^16: 0.58 -> 0.86 ns/elem), because GCC's good lowering of the
+    short-circuit is `cmp first; je <second-key>` -- the je fires only on
+    first-key TIES, which are rare on high-cardinality data, so the predictor
+    nails it and the second-key load is SKIPPED; branchless pays for the
+    second key on every element.  Echoed by docs/offset_partition.md
+    ("...consistent with the documented negative result on fully-branchless
+    lex compares for fixed-pivot partitions"), docs/partition_schemes.md
+    (pair-lex = "expensive comparator" -> block partition from n=16; the
+    gap-Lomuto is throughput-bound on comparator latency), and
+    docs/partition_efficiency.md ("Lomuto is the WORST choice for pair64-lex").
+
+WHAT I ACTUALLY DID WRONG, ROUND BY ROUND:
+  * Round 1: noted pair-lex slowness in MY numbers, logged idea A5 citing the
+    NETWORK-pole fix, deferred it -- without reading algorithms.hpp/docs where
+    the FIXED-PIVOT pole was already measured and resolved differently.  Also
+    built gap_cyclic (a Lomuto variant) and benchmarked pair-lex through it;
+    the docs already said Lomuto is the worst home for pair-lex.
+  * Round 2: implemented the network-pole comparator for the scan-pole
+    problem.  It "won" 1.7-3x in my benchmarks ONLY because my baseline TU
+    had the BAD lowering of operator< (a ~50/50 mispredicting branch on the
+    first-key ORDER, not the rare-tie je): flat pair64-lex measured 1.85-1.95
+    ns/elem in my bench context vs ~0.58 for the same algorithm with the good
+    lowering in the library's study.  I beat a strawman and shipped the
+    documented-negative variant for 16-byte pairs.
+
+GENUINELY NEW (not in any repo doc):
+  * lex_less_packed -- 4+4-byte integer pairs as ONE u64 compare
+    (rotl+sign-bias).  Strictly dominates BOTH poles for those types (no
+    second-key anything, no branch, no setcc chain), exact operator<
+    semantics.  p32-lex user path: 0.49-0.96 ns/elem (3.4-6.6x vs my branchy
+    baseline; also beats the library's good-lowering model, which still pays
+    cmp+cmov+rare-je).
+  * The MECHANISM of the context instability: (a) GCC lowers the pair
+    short-circuit compare per inlining context either as the rare-tie je
+    (good) or as a mispredicting first-key order branch (bad); (b) for
+    multi-setcc predicates, register allocation can land a setcc on a
+    store-forwarded reload (partial-register merge -> carried chain 4->12
+    cycles).  The repo brushed this ("kernels inlined into timing loops
+    scatter +-20% by code alignment -- unusable", offset_partition.md) but
+    never diagnosed it.
+
+3.2 THE CORRECTED COMPARATOR MODEL (what should have been shipped)
+  element class                 partition-scan predicate
+  ---------------------------   -----------------------------------------
+  4+4-byte integer pair          lex_less_packed  (one u64 cmp; NEW)
+  16-byte pairs, float pairs     lex_less_semibranch (NEW):
+                                     bool r = a.first < k.first;
+                                     if (a.first == k.first) [[unlikely]]
+                                         r = a.second < k.second;
+                                 = the algorithms.hpp documented optimum
+                                 (cmov main path + rare-tie branch), but
+                                 PINNED AT THE SOURCE LEVEL so the lowering
+                                 no longer depends on the inlining lottery.
+  networks/cswap                 unchanged (3-setcc branchless: their pole).
+  lex_less_branchless (3-setcc)  demoted: big-endian fallback only; kept
+                                 measured for reference.
+  Adversarial note: semibranch mispredicts only when first-key ties are
+  ~50/50 random AND seconds decide -- there the second-key work is genuine;
+  same trade the library ships.
+
+3.3 PREVENTION PLAN (process rules; also going into auto-memory)
+  P-A  Before optimizing ANY comparator/predicate/idiom: grep BOTH this
+       header's comments AND include/partitions/*.hpp AND docs/*.md for the
+       axis being touched.  This repo keeps NEGATIVE results deliberately --
+       they are load-bearing; an optimization that contradicts one is wrong
+       until the contradiction is explained.
+  P-B  A measured win must name its BASELINE'S codegen, not just its
+       baseline: disassemble both sides before believing a >1.5x delta on a
+       compare-bound loop (my round-2 win was real vs MY baseline and
+       irrelevant vs the documented one).
+  P-C  Comparator cost is CLASS-dependent: element-vs-element (networks,
+       sorts) and element-vs-fixed-key (partitions) have DIFFERENT optima;
+       never port a predicate fix across that boundary without an A/B.
+  P-D  Context fragility is a first-class hazard: measure every hot kernel in
+       >= 3 instantiation contexts (direct call, through the public
+       dispatcher, standalone noinline) before setting dispatch constants.
+  P-E  When a type runs >2x slower than its byte-width peers on the same
+       kernel, treat it as a BUG to root-cause (read the asm), not as a
+       property of the type to gate around.
+
+3.4 ROUND-3 WORK PLAN
+  1. Move the substitution machinery from detail::cyclic to detail::net (it
+     must precede the flat kernels); add lex_less_semibranch; the chooser
+     subst_lex_comp_t = packed (int 4+4, little-endian) else semibranch.
+  2. PORT: substitute at the FLAT public entry points -- sized_partition,
+     sized_partition_at, offset_partition.  median_partition needs no edit:
+     its keyed phase calls sized_partition (inherits the substitution); its
+     halver tier keeps the untouched network comparators.
+  3. Cyclic entries switch to the same chooser.  Gate re-check: semibranch is
+     single-setcc-class -> expect generic gates; the _mlex gates stay keyed
+     on the demoted 3-setcc comparator.  Validate by regret, adjust if not.
+  4. Tests: the suite so far exercised flat kernels only THROUGH cyclic
+     entries; add direct oracle tests for sized_partition /
+     sized_partition_at / offset_partition / median_partition across all
+     type-configs (this gap is itself a P-D violation to fix).
+  5. Asm: verify semibranch lowers as cmov+rare-je in scan loops (both a
+     standalone and the dispatcher instantiation); packed unchanged.
+  6. EXTENSIVE benchmarks: {p32,p64,pf32,pd64} x {raw less<>, 3-setcc,
+     semibranch, packed-where-applicable} x flat/cyclic x plain/offset x
+     sizes 16..2^22 (+ i64/i32 regression sanity).  Flat before/after tables
+     (before = R3/R4 CSVs).  Winner tables decide the final chooser + gates.
+
+--------------------------------------------------------------------------------
+3.5 ROUND-3 RESULTS (Meteor Lake P-core, GCC 15.2, -O3 -march=native,
+    min ns/elem; 12 plain + 8 offset slices, methodology unchanged)
+--------------------------------------------------------------------------------
+THE PORT (flat sized_partition, user path w/ std::less<>; before -> after):
+                 n=64          n=1024        n=65536       n=2^20
+    p32 lex   3.30 -> 0.63   1.91 -> 0.64   1.83 -> 0.52   1.87 -> 0.55
+    p64 lex   2.47 -> 1.24   1.92 -> 0.69   1.85 -> 0.58   1.90 -> 0.72
+    pf32 lex  3.63 -> 1.29   3.66 -> 1.10   3.60 -> 1.02   3.66 -> 1.04
+    pd64 lex  4.03 -> 1.71   3.64 -> 1.23   3.64 -> 1.08   3.73 -> 1.08
+  RECONCILIATION CLOSED: ported flat p64 at 2^16 = 0.58 ns/elem -- the exact
+  figure algorithms.hpp records for the good short-circuit lowering.  The
+  port did not beat the library's documented optimum; it PINNED it (and the
+  packed comparator beats it for p32: 0.52 vs the 0.58-class).
+  Flat offset_partition inherits it (pd64 of=n/2: ~1.9 -> 0.56-0.68).
+
+COMPARATOR SHOOT-OUT (direct kernels, w=0.5): semibranch vs 3-setcc --
+  seg_bridge/seg_fill: semibranch wins everywhere (p64 fill 2^16 0.81->0.64,
+  pd64 gap 2.76->1.53, pf32 br 1.49->1.32), confirming the algorithms.hpp
+  negative result once the baseline lowering is controlled.  The only cells
+  where 3-setcc "won" were lottery-won gap instantiations (p64/pf32 gap
+  ~0.9) -- unreliable by construction.  packed (p32): 0.52-0.65 FLAT across
+  every kernel and context; no variance, no lottery.
+TIER VALIDATION under the pinned comparators: dispatcher-vs-best-kernel mean
+  regret p64sb -7.9% / pd64sb +3.8% / pf32sb +7.7% / p32pk +5.5% (worst
+  cells at n=16 extremes) -> generic plain gates confirmed for the
+  substituted classes; offset gate re-measured: semibranch pairs gate at 256
+  (joint regret 5.5% vs 10.9% at 1024; p64 pays ~0.2 ns/elem only in the
+  suffix~512 boundary band, pd64 gains 1.05->0.79).  i64/i32 unchanged
+  (regression-clean).
+
+FINAL STATE OF THE SUBSTITUTION (all public entry points, flat + cyclic):
+    4+4-byte integer pairs    -> lex_less_packed    (plain gates: generic;
+                                                     offset: generic)
+    other pair-lex            -> lex_less_semibranch (plain: generic;
+                                                     offset gate 256)
+    networks (cswap)          -> untouched 3-setcc fast path
+    lex_less_branchless       -> big-endian fallback + reference only
+  Tests: 15,543,712 checks incl. direct flat-entry oracle coverage
+  (sized_partition, sized_partition_at, offset_partition, median_partition),
+  green at -O1/-O3/ASan+UBSan.  median_partition needed no code change (its
+  keyed phase inherits the substitution through sized_partition; its halver
+  tier keeps the network comparators -- the class boundary of P-C).
+================================================================================
+
+================================================================================
+ROUND 4 -- FIND-MINIMUM FOR A CYCLIC BUFFER (optimized for n < 12)
+================================================================================
+4.1 PRIOR ART (P-A audit, done BEFORE design; sources:
+    include/partitions/quicksort_lr.hpp detail::find_min + docs/quicksort_lr.md)
+  * The repo's find_min dispatches on PROJECTED-KEY width:
+      - narrow (scalar <= 8B): TWO-accumulator even/odd scan, branchless
+        cmov updates; breaks the loop-carried cmp->cmov(best)->cmp chain
+        (~2 cy/elem single-lane); measured to win from L ~ 16 UP -- i.e. for
+        n < 12 a SINGLE accumulator is the right default, not two.
+      - wide (16-byte lex pair): SINGLE accumulator, BRANCHY update -- a
+        running-minimum update fires with probability ~1/i (harmonic), so
+        the branch predicts almost perfectly and the rare 16-byte copy runs
+        only on real updates; forcing a branchless blend pays 16 bytes per
+        element and is 2-3x SLOWER (same class boundary as the partition
+        compare; P-C respected).
+  * CODEGEN NOTE (measured there, reused here): write narrow updates in the
+    BRANCHY source form `if (comp(k,best)) { best=k; idx=j; }` -- GCC lowers
+    it to ONE cmp + 2 cmov; the "obviously branchless" double-ternary
+    clobbers `best` before the index select and wastes a second compare.
+  * cond_assign: 16B keys via two-word XOR-mask; 8-byte NON-INTEGRAL keys
+    (double) forced through a GP-register XOR blend (an XMM-resident
+    conditional copy becomes a branch); integrals via ternary->cmov.
+  * Kept negative results binding this design: >= 4 accumulators lose to 2;
+    tournament/network min loses to the linear 2-acc scan; min+max
+    double-ended is out of spec.  "Double scanning" = the 2-acc even/odd
+    interleave (adopted for the large tier only).
+
+4.2 API + CONTRACT
+  partitions::find_min(first, last, comp, proj)            -> iterator (flat)
+  partitions::cyclic_find_min(first, last, bb, be, comp, proj) -> iterator
+    Range convention identical to cyclic_partition (first>last wraps; empty
+    when first==last -> returns first).  Returns a PHYSICAL iterator to A
+    minimal element of the logical range.  TIE RULE: any minimal element
+    (the repo's find_min contract, NOT std::min_element's first-occurrence
+    -- the 2-acc lanes already give that up; across segments S1 is preferred
+    on ties, so the flat/wrapped results agree on tie-free data).
+  Self-containment: the narrow/wide kernels are re-implemented inside
+  refactored_partitions.hpp (credited), since the header must not include
+  library headers.
+
+4.3 KEY CLASSIFICATION (reuses the round-3 comparator playbook)
+  K = projected key type; with default-less + identity on pair elements:
+    - int_pair_packable (4+4B int pairs): scan as PACKED u64 -- proj' =
+      lex_less_packed::pack, comp' = less<u64>.  The key becomes an 8-byte
+      integral => the NARROW machinery applies wholesale (single-cmp cmov
+      updates, 2-acc large tier).  Strictly better than any pair-form scan.
+    - other lex pairs (16B, float-first 8B): WIDE branchy kernel with
+      lex_less_semibranch substituted (pins the short-circuit optimum the
+      repo's wide kernel relies on, immune to the lowering lottery).
+  first-proj pairs / scalars: K is a scalar: narrow if <= 8B (double/float
+  keys go through the GP-blend cond_assign), else wide.
+
+4.4 CANDIDATE KERNELS (cyclic; S1=[first,be), S2=[bb,last))
+  M1 unified SINGLE-accumulator: one (best,pos) pair carried through two
+     back-to-back segment loops -- no second init, no combine step, no wrap
+     arithmetic anywhere; position tracked as a cmov-able raw pointer.
+     Predicted winner for n < 12 (setup dominates there).
+  M2 unified TWO-accumulator (narrow, large tier): lanes alternate within
+     each segment and CARRY across the wrap (lane parity need not be global
+     -- any 2-way split works); one tail fix per segment; single combine at
+     the end.  Expected winner from n ~ 16 up, per the repo threshold.
+  M3 per-segment find_min + combine (2 inits + 1 compare): the composability
+     baseline M1/M2 must beat.
+  M4 AVX2 masked-load SIMD (i32/i64 identity only): per segment
+     ceil(len/W) vpmaskmov loads accumulated with vpmin (i32) / cmp+blend
+     (i64: no vpminsq on AVX2), horizontal min, then position by
+     vpcmpeq+movmsk+tzcnt per loaded block.  Branchless, ~20-30 uops flat;
+     candidate to beat M1 at n ~ 8-11.  Masked loads are the ONLY safe way
+     to touch partial vectors here (segments end at the buffer edges).
+  M5 exhibits: naive per-step wrap-cmov logical loop; std::min_element on a
+     flat layout (reference floor).
+  REJECTED without measurement: tiny-n copy-out to a stack buffer (two
+  memcpys + map-back; the partition rounds showed the copy tax; kept as a
+  fallback idea only), tournament trees (documented negative).
+
+4.5 DISPATCH PLAN (constants to be measured)
+  flat (first <= last)      -> find_min (narrow: n<=SMALL -> 1-acc, else
+                               2-acc; wide: always 1-acc branchy)
+  wrapped, len2==0          -> flat on S1
+  wrapped                   -> n <= SMALL_CYC (~12-16?) -> M1
+                               narrow & larger          -> M2
+                               wide & larger            -> M1 (wide stays
+                                                          1-acc at all n)
+  M4 slots in for the simd class if it beats M1/M2 where measured.
+
+4.6 TESTS
+  Oracle: returned iterator lies in the logical range AND no logical element
+  is comp-less than it (any-minimal contract); flat find_min additionally
+  cross-checked against std::min_element's VALUE.  Exhaustive n in [1,12] x
+  all wrap splits x dup-heavy small domains (ties exercised) x all 8
+  type-configs; randomized n to 4096; empty/n=1/len2=1/flat-delegation edges.
+
+4.7 BENCHMARK PLAN
+  ns/CALL is the honest unit at n < 12 (report ns/elem alongside); heavy
+  batching (>= 2^15 independent blocks per sample, fresh data, min-of-25);
+  n in {2,3,4,5,6,8,10,11,12,16,24,32,64,128}; wrapped splits len2 in
+  {1, n/2, n-1} + flat placement; contenders M1/M2/M3/(M4)/M5 + dispatcher;
+  types i32,i64 (identity), p32/p64/pf32/pd64 lex, p64/pd64 first.
+  Regression guard: flat find_min vs the repo's own kernels' numbers.
+4.8 ASM CHECKLIST
+  narrow update = cmp + 2 cmov (no best reload, no second cmp); wide update
+  = one rare branch; no wrap checks in any loop body; float keys blended in
+  GP registers (cond_assign discipline); M4 masked loads + tzcnt position.
+
+--------------------------------------------------------------------------------
+4.9 ROUND-4 RESULTS (Meteor Lake P-core, GCC 15.2, min ns/CALL, w=0.5 wraps)
+--------------------------------------------------------------------------------
+ASM verified: i64 narrow lanes = `cmp; cmovg; cmovg` (one compare, both
+cmovs); p32 scans packed keys via `rorx mem,32; xor` folded loads; p64 wide
+keeps the pinned rare-branch update.
+
+TWO MID-COURSE CORRECTIONS (each caught by the reference columns, per P-B/P-D):
+  C1. The round-3 semibranch substitution is WRONG for min scans and was
+      removed: a running-minimum compare is element-vs-RUNNING-BEST with
+      harmonic (~1/i) update probability -- the raw short-circuiting
+      operator< is already optimal there (the source study's own wide-kernel
+      rationale; yet another P-C class boundary).  Measured: float-pair
+      dispatch at n=3 dropped 8.75 -> 2.85 ns/call after removal, and
+      std::min_element (raw compare) had flagged the problem by beating the
+      substituted kernel 2-3x.  Only the packed-u64 int-pair image survives
+      (it turns the scan narrow-class; wins from n ~ 16, ties below).
+  C2. The bench's M4 SIMD prototype overflowed its vector-block arrays for
+      n >= 8 (vs[4] with up to 6 chunks) -- first-run SIMD numbers were
+      invalid; fixed (vs[8], gated to n <= 12).
+
+FINDINGS THAT SET THE FINAL TIERS:
+  * M3 (per-segment scans + one combine) is the best small tier at n < 14
+    for ALL classes: the two segments' independent (best,pos) chains overlap
+    in the out-of-order window -- a segment-level "double scan" (i64 n=4:
+    1.63 vs 2.24 unified; n=8: 2.67 vs 3.21).
+  * The classic 2-accumulator tier holds for narrow keys from n ~ 16 (as the
+    source study measured), AND -- new result -- a BRANCHY-update two-lane
+    scan also wins for WIDE keys at large n (it is the branchless per-element
+    blend that loses, not the second lane): pf32/pd64 n=1024 halve
+    (2060 -> 1060, 2069 -> 1115 ns), p64 720 -> 506.  Crossover is
+    member-dependent: float-first pairs ~24, integer 16B pairs ~256
+    (wide_two_acc_min<K>).
+  * M4 masked-load SIMD LOSES at the target sizes (i64 n<=12: 5.3-7.6 vs
+    scalar 1.4-4.8 ns/call -- vpmaskmov latency + setup dwarf an 11-element
+    problem); kept as a negative result.  (A full SIMD tier for LARGE flat
+    n remains promising but is out of this round's scope.)
+FINAL DISPATCH (find_min / cyclic_find_min):
+    flat  : packed image for 4+4B int pairs; narrow 2-acc from 16; wide
+            2-lane from wide_two_acc_min<K> (24 float-first / 256 int);
+            single accumulator below the gates.
+    cyclic: n < 14 -> per-segment M3; above -> unified 2-lane (narrow >= 16,
+            wide >= wide_two_acc_min<K>); else unified single-acc.
+HEADLINE (dispatcher, wrapped mid-split, ns/call; naive = %-indexed loop;
+std = std::min_element on a FLAT layout, i.e. zero wrap logic):
+             n=4          n=8          n=11         n=1024
+    i64   2.35 (nv 8.5)  3.31 (17.1)  5.17 (23.5)  321  (nv 2187)
+    p32   2.78 (8.7)     4.38 (17.1)  5.66 (23.5)  406  (2188)
+    p64   3.58 (8.5)     4.99 (17.1)  6.46 (23.5)  506  (2209)
+    pf32  4.52 (18.8)    9.70 (33.3)  14.0 (42.4)  1060 (2242)
+    vs flat std::min_element the wrapped dispatcher costs 1.07-1.6x at
+    n < 12 (entry checks + second-segment handling) and WINS from n ~ 16 on
+    narrow keys (2-acc) and everywhere at large n (2-lane, up to 1.7x).
+Tests: 15,558,532 checks (exhaustive n<=12 x all splits x dup-heavy domains,
+any-minimal + in-range oracle, flat find_min cross-checked against
+std::min_element by value), green at -O3 and under ASan+UBSan.
+================================================================================
